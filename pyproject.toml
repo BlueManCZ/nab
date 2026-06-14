@@ -1,0 +1,41 @@
+[project]
+name = "nab"
+dynamic = ["version"]
+description = "Native GTK4/libadwaita app that plays local files, web streams, and magnets via mpv"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "PyGObject>=3.50",
+    "yt-dlp>=2025.1.1",
+    "python-mpv-jsonipc>=1.2.2",
+    "tomli-w>=1.0",
+]
+
+[project.optional-dependencies]
+# Both link against system libraries and degrade gracefully when absent
+# (see nab.torrent.is_available / nab.subtitles.is_available), so they're
+# extras rather than hard requirements.
+torrent = ["libtorrent>=2.0.10"]
+subtitles = ["subliminal>=2.2"]
+
+[project.scripts]
+nab = "nab.__main__:main"
+
+[build-system]
+# PEP 639 license metadata (SPDX string + license-files) needs hatchling >= 1.27.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+# Single source of truth: __version__ in nab/__init__.py.
+path = "nab/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nab"]
+
+[tool.uv]
+# PyGObject and pycairo build from sdist against the system GObject-introspection
+# and cairo dev libraries, then run entirely from the venv (no system-site-packages
+# needed). No extra config required — this section is kept as a marker.

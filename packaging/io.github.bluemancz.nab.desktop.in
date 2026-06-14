@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Nab
+GenericName=Video Player
+Comment=Play local files, web URLs (YouTube etc.), and magnet links
+Exec=@EXEC@ %U
+TryExec=@TRYEXEC@
+Icon=multimedia-player
+Terminal=false
+Categories=AudioVideo;Player;Video;GTK;
+MimeType=video/3gpp;video/mp2t;video/mp4;video/mpeg;video/ogg;video/quicktime;video/webm;video/x-flv;video/x-m4v;video/x-matroska;video/x-ms-asf;video/x-ms-wmv;video/x-msvideo;audio/aac;audio/flac;audio/mp4;audio/mpeg;audio/ogg;audio/opus;audio/x-vorbis+ogg;audio/x-wav;x-scheme-handler/magnet;
+Keywords=video;movie;player;mpv;
+StartupNotify=true
+StartupWMClass=io.github.bluemancz.nab
