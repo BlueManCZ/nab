@@ -16,8 +16,8 @@ from nab.history import HistoryDatabase  # noqa: E402
 from nab.history.sidebar import HistorySidebar  # noqa: E402
 from nab.playback import PlaybackConfig  # noqa: E402
 from nab.player import Player  # noqa: E402
-from nab.resolver import ResolvedSource, SourceType, resolve  # noqa: E402
-from nab.resolver.source import magnet_for_cache_path  # noqa: E402
+from nab.resolver import ResolvedSource, resolve  # noqa: E402
+from nab.resolver.source import TORRENT_FILE_SUFFIX, torrent_for_cache_path  # noqa: E402
 from nab.series.nav import SeriesNavigator  # noqa: E402
 from nab.subtitles import SubtitlesConfig  # noqa: E402
 from nab.torrent.stats_view import TorrentStatsView  # noqa: E402
@@ -174,7 +174,9 @@ class NabWindow(Adw.ApplicationWindow):
         title_box.set_halign(Gtk.Align.FILL)
 
         self.input_entry = Gtk.Entry()
-        self.input_entry.set_placeholder_text("Paste a URL, magnet, or file path…")
+        self.input_entry.set_placeholder_text(
+            "Paste a URL, magnet, .torrent, or file path…"
+        )
         self.input_entry.set_hexpand(True)
         self.input_entry.connect("activate", self._on_input_activate)
         title_box.append(self.input_entry)
@@ -212,12 +214,12 @@ class NabWindow(Adw.ApplicationWindow):
         self.video_status_page.set_icon_name("video-x-generic-symbolic")
         self.video_status_page.set_title("Nab anything")
         self.video_status_page.set_description(
-            "Paste a URL, magnet, or file path above and press Enter. "
-            "The video plays in mpv's own window."
+            "Paste a URL, magnet, or file path above and press Enter — "
+            "a .torrent file works too. The video plays in mpv's own window."
         )
         self.video_status_page.set_vexpand(True)
         # Live torrent dashboard lives in the status page's content slot; it
-        # only becomes visible while a magnet is streaming (see _loadfile_now).
+        # only becomes visible while a torrent is streaming (see _loadfile_now).
         self.torrent_stats.widget.set_visible(False)
         self.video_status_page.set_child(self.torrent_stats.widget)
         return self.video_status_page
@@ -320,7 +322,7 @@ class NabWindow(Adw.ApplicationWindow):
         return False
 
     def queue_initial_play(self, text: str) -> None:
-        """Play an input handed in at launch (file manager, CLI arg, magnet).
+        """Play an input handed in at launch (file manager, CLI arg, magnet…).
 
         mpv is started on demand by the resolve→playback path, so we can just
         play; there's no player to wait for.
@@ -427,11 +429,11 @@ class NabWindow(Adw.ApplicationWindow):
 
     def _on_open_file_clicked(self, _button: Gtk.Button) -> None:
         dialog = Gtk.FileDialog()
-        dialog.set_title("Open video")
+        dialog.set_title("Open video or torrent")
 
         video_filter = Gtk.FileFilter()
-        video_filter.set_name("Video & audio")
-        for ext in MEDIA_EXTENSIONS:
+        video_filter.set_name("Video, audio & torrents")
+        for ext in (*MEDIA_EXTENSIONS, TORRENT_FILE_SUFFIX):
             bare = ext.lstrip(".")
             video_filter.add_pattern(f"*.{bare}")
             video_filter.add_pattern(f"*.{bare.upper()}")
@@ -468,7 +470,7 @@ class NabWindow(Adw.ApplicationWindow):
         # mpv is spawned on demand once we know what to play (see
         # _begin_playback), so resolving can start without a running player.
         self._set_resolving(True)
-        # A previous magnet may still be polling stats into the card; silence it
+        # A previous torrent may still be polling stats into the card; silence it
         # so resolve-progress and "Starting mpv…" messages aren't overwritten.
         self._stop_torrent_stats()
 
@@ -480,7 +482,7 @@ class NabWindow(Adw.ApplicationWindow):
                 source = resolve(text, on_progress=on_progress)
             except FileNotFoundError as exc:
                 # A local file is gone. If it's a stranded torrent-cache file we
-                # can re-fetch it via the magnet that produced it — but that
+                # can re-fetch it via the torrent that produced it — but that
                 # lookup touches the history DB, which is main-thread-only, so
                 # hop back over there to decide. `recovering` stops a recovered
                 # play that still fails from looping.
@@ -500,28 +502,29 @@ class NabWindow(Adw.ApplicationWindow):
         threading.Thread(target=worker, name="resolver", daemon=True).start()
 
     def _try_recover_cache_miss(self, missing: str, original_error: str) -> bool:
-        """Re-fetch a deleted torrent-cache file via its magnet (main thread).
+        """Re-fetch a deleted torrent-cache file via its torrent (main thread).
 
         A finished torrent can be played straight from the cache as a local
         file; clearing the cache then leaves that history entry pointing at
-        nothing. Map the missing path back to the magnet that downloaded it and
-        resolve that instead, which re-acquires the file. Falls back to the
-        original "no such file" error when there's no magnet to recover from.
+        nothing. Map the missing path back to the magnet (or .torrent) that
+        downloaded it and resolve that instead, which re-acquires the file.
+        Falls back to the original "no such file" error when there's no torrent
+        source to recover from.
         """
-        magnet: str | None = None
+        recovery: str | None = None
         from nab.torrent import is_available
         if is_available():
             from nab.torrent.config import TorrentConfig
             cache_dir = TorrentConfig.load().effective_cache_dir
-            magnet = magnet_for_cache_path(
-                missing, cache_dir, self.history.magnet_inputs()
+            recovery = torrent_for_cache_path(
+                missing, cache_dir, self.history.torrent_inputs()
             )
-        if magnet is None:
+        if recovery is None:
             self._on_resolve_failed(original_error)
             return False
         log.info("cache miss for %s — re-fetching via torrent", missing)
         self._on_resolve_progress("File missing from cache — re-fetching from torrent…")
-        self._resolve_async(magnet, recovering=True)
+        self._resolve_async(recovery, recovering=True)
         return False
 
     def _set_resolving(self, busy: bool) -> None:
@@ -551,7 +554,7 @@ class NabWindow(Adw.ApplicationWindow):
 
     def _on_resolved(self, source: ResolvedSource) -> bool:
         self._set_resolving(False)
-        if source.source_type is not SourceType.MAGNET:
+        if not source.source_type.is_torrent:
             self._teardown_torrent(full=False)
         self._current_source = source
         try:
@@ -609,7 +612,7 @@ class NabWindow(Adw.ApplicationWindow):
         # atomically as part of opening the file. A follow-up seek would race
         # against file-loaded — mpv silently drops time-pos as "property
         # unavailable" until the demuxer has the file open, which on slow
-        # sources (large MKVs, magnet streams) can be hundreds of ms after
+        # sources (large MKVs, torrent streams) can be hundreds of ms after
         # the loadfile ack.
         resume_pos: float | None = None
         if self._current_entry_id is not None:
@@ -628,10 +631,10 @@ class NabWindow(Adw.ApplicationWindow):
         self.video_status_page.set_description(
             f"Source: {source.source_type.value}. Playing in mpv's window."
         )
-        # Magnets keep downloading in the background while mpv plays, so show
+        # Torrents keep downloading in the background while mpv plays, so show
         # the live transfer dashboard; everything else hides it.
         self._stop_torrent_stats()
-        if source.source_type is SourceType.MAGNET:
+        if source.source_type.is_torrent:
             self.torrent_stats.reset()
             self.torrent_stats.widget.set_visible(True)
             self._start_torrent_stats()

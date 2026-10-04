@@ -362,7 +362,7 @@ def _retime(path: Path, alignment: Alignment) -> bool:
 
 def _bundled_references(source: ResolvedSource) -> list[Path]:
     """Sidecars the torrent itself shipped — already timed to this release."""
-    if source.source_type is not SourceType.MAGNET:
+    if not source.source_type.is_torrent:
         return []
     from nab.torrent import is_available
 
@@ -378,11 +378,11 @@ def _bundled_references(source: ResolvedSource) -> list[Path]:
 
 
 def _video_path(source: ResolvedSource) -> Path | None:
-    """The video on disk. For a magnet that's the torrent cache, not the
+    """The video on disk. For a torrent that's the torrent cache, not the
     HTTP URL mpv streams — probing the URL would pull pieces we don't need."""
     if source.source_type is SourceType.LOCAL_FILE:
         return Path(source.playable_url)
-    if source.source_type is not SourceType.MAGNET:
+    if not source.source_type.is_torrent:
         return None
     from nab.torrent import is_available
 

@@ -1,7 +1,7 @@
 [project]
 name = "nab"
 dynamic = ["version"]
-description = "Native GTK4/libadwaita app that plays local files, web streams, and magnets via mpv"
+description = "Native GTK4/libadwaita app that plays local files, web streams, magnets and torrents via mpv"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]

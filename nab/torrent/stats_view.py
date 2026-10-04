@@ -1,6 +1,6 @@
 """Live torrent transfer stats, rendered as a small dashboard.
 
-Shown on the now-playing card while a magnet streams. Holds no libtorrent
+Shown on the now-playing card while a torrent streams. Holds no libtorrent
 dependency — it just reads attributes off whatever status snapshot it's
 handed (see ``TorrentStatus`` in :mod:`nab.torrent.engine`), so it imports
 cleanly even when libtorrent isn't installed.

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from nab import SUBTITLE_EXTENSIONS
 from nab.paths import cache_home
 from nab.resolver import ResolvedSource, SourceType
-from nab.resolver.source import magnet_info_hash, split_magnet_fragment
+from nab.resolver.source import TORRENT_SOURCE_TYPES, split_torrent_fragment
 from nab.subtitles.config import SubtitlesConfig
 
 if TYPE_CHECKING:
@@ -24,9 +24,11 @@ type SearchPlan = tuple["Video", Path | None] | list[Path] | None
 _FREE_PROVIDERS = ["podnapisi", "gestdown", "tvsubtitles"]
 
 # Source types we can look subtitles up for. Local files are scanned off
-# disk; magnets are matched on their release name. A web/direct URL gives us
+# disk; torrents are matched on their release name. A web/direct URL gives us
 # neither a file to hash nor a reliable release name, so it's out.
-DISCOVERABLE_SOURCE_TYPES = frozenset({SourceType.LOCAL_FILE, SourceType.MAGNET})
+DISCOVERABLE_SOURCE_TYPES = (
+    frozenset({SourceType.LOCAL_FILE}) | TORRENT_SOURCE_TYPES
+)
 
 
 def _once(fn: Callable[[], None]) -> Callable[[], None]:
@@ -132,7 +134,7 @@ def _parse_language(code: str):
 def _subs_cache_dir(key: str | None = None) -> Path:
     """The directory cached subtitles live in, optionally scoped by `key`.
 
-    Magnets pass their info-hash: the file inside a torrent is often named
+    Torrents pass their info-hash: the file inside a torrent is often named
     something generic (`movie.mkv`), and a flat cache would hand one film's
     subtitles to the next one with the same inner filename.
     """
@@ -144,14 +146,31 @@ def _subs_cache_dir(key: str | None = None) -> Path:
 
 
 def _release_name(source: ResolvedSource) -> str | None:
-    """The magnet's in-torrent path, which is what guessit reads best.
+    """The torrent's in-torrent path, which is what guessit reads best.
 
     Prefers the full `#file=` sub-path over the bare filename: the parent
     directory usually carries the release name (`Movie.2023.1080p-GRP/`),
     and guessit uses that context when the filename alone is thin.
     """
-    _, sub_path = split_magnet_fragment(source.original_input)
+    _, sub_path = split_torrent_fragment(source.original_input)
     return sub_path or source.title
+
+
+def _torrent_cache_key(source: ResolvedSource) -> str | None:
+    """The open torrent's info-hash, used to scope its cached subtitles.
+
+    Read straight off the source rather than asked of the engine, so it stays
+    pinned to the torrent this search is for even if the user has since
+    started another one.
+    """
+    from nab.torrent import is_available
+
+    if not is_available():
+        return None
+    from nab.torrent.engine import torrent_identity
+
+    base_uri, _ = split_torrent_fragment(source.original_input)
+    return torrent_identity(base_uri)
 
 
 def _plan_local(
@@ -178,8 +197,8 @@ def _plan_local(
     return video, (None if config.save_next_to_video else _subs_cache_dir())
 
 
-def _plan_magnet(source: ResolvedSource, force: bool) -> SearchPlan:
-    """Build the search plan for a magnet.
+def _plan_torrent(source: ResolvedSource, force: bool) -> SearchPlan:
+    """Build the search plan for a magnet or .torrent file.
 
     Matches on the release name rather than scanning the file: the torrent
     cache holds a partially-downloaded sparse image whose hash is meaningless,
@@ -196,7 +215,7 @@ def _plan_magnet(source: ResolvedSource, force: bool) -> SearchPlan:
     if not release:
         return None
 
-    save_dir = _subs_cache_dir(magnet_info_hash(source.original_input))
+    save_dir = _subs_cache_dir(_torrent_cache_key(source))
     if not force:
         cached = sidecar_subtitles(save_dir, Path(release).stem)
         if cached:
@@ -238,7 +257,7 @@ def discover_for_source(
     plan = (
         _plan_local(source, config, force)
         if source.source_type is SourceType.LOCAL_FILE
-        else _plan_magnet(source, force)
+        else _plan_torrent(source, force)
     )
     if plan is None:
         return []

@@ -10,7 +10,7 @@ from pathlib import Path
 import libtorrent as lt
 
 from nab import SUBTITLE_EXTENSIONS, VIDEO_EXTENSIONS
-from nab.resolver.source import magnet_info_hash
+from nab.resolver.source import is_http_url, is_magnet_uri, magnet_info_hash
 from nab.series import detect_series
 from nab.torrent.config import TorrentConfig
 from nab.torrent.http_server import ByteRangeServer
@@ -93,6 +93,60 @@ def _cache_dir() -> Path:
 
 def _resume_path(info_hash: str) -> Path:
     return _cache_dir() / f"{info_hash}.resume"
+
+
+def _metainfo_path(uri: str) -> str:
+    """The .torrent file `uri` names: itself, or its cached download.
+
+    Lets every entry point below take any torrent source uniformly — a URL
+    resolves to the copy ``nab.resolver.metainfo`` pulled down for it, which
+    the resolver has already made sure is there.
+    """
+    if not is_http_url(uri):
+        return uri
+    from nab.resolver.metainfo import cache_path
+
+    return str(cache_path(uri))
+
+
+def _read_torrent_file(uri: str) -> lt.torrent_info:
+    """Parse the .torrent file `uri` names into libtorrent's metadata object.
+
+    Raises ValueError (rather than libtorrent's RuntimeError) so a bad file
+    surfaces to the user the same way any other unusable input does — naming
+    the source they gave us, not the cache path we read it from.
+    """
+    try:
+        return lt.torrent_info(_metainfo_path(uri))
+    except Exception as exc:
+        raise ValueError(f"Not a readable .torrent file: {uri}") from exc
+
+
+def _hash_string(hashes: lt.info_hash_t) -> str:
+    """Hex identity for a torrent, preferring its v1 info-hash.
+
+    Magnets carry the v1 hash in ``urn:btih:``, so preferring v1 means a
+    hybrid torrent opened as a file and as a magnet share one identity — and
+    with it one resume file and one subtitle cache directory.
+    """
+    return str(hashes.v1 if hashes.has_v1() else hashes.v2)
+
+
+def torrent_identity(uri: str) -> str | None:
+    """The info-hash the torrent source `uri` names, read without the swarm.
+
+    Every form carries its identity locally: a magnet in its ``urn:btih:``
+    parameter, a .torrent file — downloaded or on disk — in its info-dict.
+    Returns None when none of them yields one (a magnet with no info-hash, an
+    unreadable or not-yet-fetched file).
+    """
+    if is_magnet_uri(uri):
+        return magnet_info_hash(uri)
+    try:
+        return _hash_string(_read_torrent_file(uri).info_hashes())
+    except Exception as exc:
+        log.warning("couldn't read an info-hash out of %s: %s", uri, exc)
+        return None
 
 
 @dataclass(slots=True, frozen=True)
@@ -183,12 +237,13 @@ def match_subtitle_files(
 
 
 class TorrentEngine:
-    """Manages a single libtorrent session for streaming magnet links.
+    """Manages a single libtorrent session for streaming torrents.
 
-    Lifecycle: ``open_magnet`` adds a torrent and returns its file list;
-    ``select_file`` switches the active file inside the open torrent and
-    starts (or restarts) the HTTP server. Re-opening the same magnet URI
-    returns the cached file list without re-adding the torrent.
+    Lifecycle: ``open_torrent`` adds a torrent — named by a magnet link or a
+    .torrent file — and returns its file list; ``select_file`` switches the
+    active file inside the open torrent and starts (or restarts) the HTTP
+    server. Re-opening the torrent that's already open returns the cached file
+    list without re-adding it.
     """
 
     def __init__(self):
@@ -218,15 +273,17 @@ class TorrentEngine:
         return self._session
 
     def _add_torrent_params(
-        self, magnet_uri: str, info_hash: str | None
+        self, uri: str, info_hash: str | None
     ) -> lt.add_torrent_params:
         """Build the params to hand ``add_torrent``.
 
-        Prefers resume data saved on a previous run: for a magnet that carries
-        the info-dict (the torrent metadata), so re-opening skips the swarm
-        metadata fetch entirely and rechecks the already-cached files locally.
-        Falls back to a bare magnet parse if there's no resume file or it's
-        unreadable (wrong version, truncated write, …).
+        Prefers resume data saved on a previous run: it carries the info-dict
+        (the torrent metadata), so re-opening skips the swarm metadata fetch
+        entirely and rechecks the already-cached files locally. Falls back to
+        the source itself — a bare magnet parse, or the .torrent file's own
+        info-dict — if there's no resume file or it's unreadable (wrong
+        version, truncated write, …). `uri` is any torrent source: a magnet, a
+        path, or the URL a metainfo file was fetched from.
         """
         if info_hash is not None:
             path = _resume_path(info_hash)
@@ -238,26 +295,33 @@ class TorrentEngine:
                     return params
                 except Exception:
                     log.exception("unreadable resume data %s; refetching", path)
-        params = lt.parse_magnet_uri(magnet_uri)
+        if is_magnet_uri(uri):
+            params = lt.parse_magnet_uri(uri)
+        else:
+            params = lt.add_torrent_params()
+            params.ti = _read_torrent_file(uri)
         params.save_path = str(_cache_dir())
         return params
 
-    def open_magnet(
+    def open_torrent(
         self,
-        magnet_uri: str,
+        uri: str,
         on_progress: ProgressCallback | None = None,
     ) -> TorrentInfo:
-        """Add the magnet to the session (if new) and return its video file list.
+        """Add the torrent to the session (if new) and return its video file list.
 
-        Blocks until metadata arrives. Re-opening the magnet that's already
-        open returns the in-memory file list for free. Across runs (or after
-        switching torrents), resume data saved on ``cleanup`` carries the
-        metadata back, so the metadata fetch is skipped rather than re-run
-        against a possibly-dead swarm.
+        `uri` is a magnet link, a path to a .torrent file, or the URL one was
+        fetched from. Blocks until metadata arrives — immediately for a
+        .torrent file, which ships its own info-dict; from the swarm for a
+        bare magnet. Re-opening the torrent that's already open returns the
+        in-memory file list for free. Across runs (or after switching
+        torrents), resume data saved on ``cleanup`` carries the metadata back,
+        so the metadata fetch is skipped rather than re-run against a
+        possibly-dead swarm.
         """
         progress = on_progress or _noop_progress
 
-        new_hash = magnet_info_hash(magnet_uri)
+        new_hash = torrent_identity(uri)
         if (
             self._handle is not None
             and self._info is not None
@@ -267,31 +331,37 @@ class TorrentEngine:
             log.info("reusing open torrent %s", new_hash)
             return self._info
 
+        # Build the params first: an unusable source (corrupt .torrent file,
+        # unparseable magnet) raises here, before we've torn down whatever is
+        # currently streaming.
+        params = self._add_torrent_params(uri, new_hash)
+
         # Different torrent (or never opened) — drop the old one.
         self.cleanup()
         ses = self._ensure_session()
-
-        params = self._add_torrent_params(magnet_uri, new_hash)
         self._handle = ses.add_torrent(params)
         self._info_hash = new_hash
         h = self._handle
 
-        timeout = TorrentConfig.load().effective_metadata_timeout
-        progress("Connecting to swarm…")
-        log.info("waiting for torrent metadata...")
-        start = time.monotonic()
-        deadline = start + timeout
-        while not h.status().has_metadata:
-            now = time.monotonic()
-            if now > deadline:
-                self.cleanup()
-                raise TimeoutError(
-                    f"Timed out waiting for torrent metadata ({timeout}s). "
-                    "The swarm may be dead or unreachable."
-                )
-            progress(_metadata_progress(h.status(), now - start))
-            time.sleep(0.5)
-        log.info("metadata received")
+        # A .torrent file (or recovered resume data) hands us the metadata up
+        # front, so skip straight past the swarm wait and its progress chatter.
+        if not h.status().has_metadata:
+            timeout = TorrentConfig.load().effective_metadata_timeout
+            progress("Connecting to swarm…")
+            log.info("waiting for torrent metadata...")
+            start = time.monotonic()
+            deadline = start + timeout
+            while not h.status().has_metadata:
+                now = time.monotonic()
+                if now > deadline:
+                    self.cleanup()
+                    raise TimeoutError(
+                        f"Timed out waiting for torrent metadata ({timeout}s). "
+                        "The swarm may be dead or unreachable."
+                    )
+                progress(_metadata_progress(h.status(), now - start))
+                time.sleep(0.5)
+            log.info("metadata received")
 
         ti = h.torrent_file()
         fs = ti.files()
@@ -342,7 +412,7 @@ class TorrentEngine:
         the existing URL.
         """
         if self._handle is None or self._info is None:
-            raise RuntimeError("No torrent open; call open_magnet first.")
+            raise RuntimeError("No torrent open; call open_torrent first.")
 
         progress = on_progress or _noop_progress
 
@@ -471,7 +541,7 @@ class TorrentEngine:
         return [f.index for f in files[pos + 1 : pos + 1 + count]]
 
     def default_file_index(self, info: TorrentInfo) -> int:
-        """Pick a sensible file to play when the user only gave us the magnet URI.
+        """Pick a sensible file to play when the user didn't name a file.
 
         If the videos look like a series (S01E01, S01E02, …), pick the
         lowest-numbered episode. Otherwise pick the largest video (which is
@@ -659,7 +729,7 @@ class TorrentEngine:
         """Persist resume data (including the info-dict) for the open torrent.
 
         Best-effort: keyed by info-hash in the cache dir, this lets the next
-        ``open_magnet`` skip the metadata fetch and the full piece re-hash.
+        ``open_torrent`` skip the metadata fetch and the full piece re-hash.
         Blocks briefly waiting for libtorrent's alert; never raises.
         """
         h, ses = self._handle, self._session

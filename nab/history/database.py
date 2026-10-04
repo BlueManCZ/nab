@@ -4,6 +4,7 @@ from pathlib import Path
 
 from nab.history.model import HistoryEntry
 from nab.paths import data_home
+from nab.resolver.source import TORRENT_SOURCE_TYPES
 
 log = logging.getLogger(__name__)
 
@@ -117,18 +118,21 @@ class HistoryDatabase:
         ).fetchone()
         return _row_to_entry(row) if row is not None else None
 
-    def magnet_inputs(self) -> list[str]:
-        """Every magnet input, most-recently-played first.
+    def torrent_inputs(self) -> list[str]:
+        """Every magnet / .torrent input, most-recently-played first.
 
         Used to recover a deleted torrent-cache file: the orphaned cache path
-        maps back to the magnet that re-downloads it (see magnet_for_cache_path).
+        maps back to the source that re-downloads it (see
+        torrent_for_cache_path).
         """
+        kinds = sorted(t.value for t in TORRENT_SOURCE_TYPES)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT input FROM history
-            WHERE source_type = 'magnet'
+            WHERE source_type IN ({",".join("?" * len(kinds))})
             ORDER BY last_played_at DESC
-            """
+            """,
+            kinds,
         ).fetchall()
         return [r["input"] for r in rows]
 

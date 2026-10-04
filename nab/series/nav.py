@@ -18,7 +18,7 @@ from gi.repository import GLib, Gtk, Pango  # noqa: E402
 
 from nab import MEDIA_EXTENSIONS  # noqa: E402
 from nab.resolver import ResolvedSource, SourceType  # noqa: E402
-from nab.resolver.source import join_magnet_fragment, split_magnet_fragment  # noqa: E402
+from nab.resolver.source import join_torrent_fragment, split_torrent_fragment  # noqa: E402
 from nab.series import SeriesItem, SeriesView, detect_series  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ class SeriesNavigator:
         """Refresh the series widget for the active source.
 
         Local files trigger filesystem-backed detection on a worker thread.
-        Magnets resolve immediately from the (already-loaded) torrent file
+        Torrents resolve immediately from the (already-loaded) torrent file
         list. Other source types just hide the widget.
         """
         self._current_source = source
@@ -116,19 +116,19 @@ class SeriesNavigator:
             threading.Thread(target=worker, name="series-detect", daemon=True).start()
             return
 
-        if source.source_type is SourceType.MAGNET:
-            view = self._magnet_series_view(source)
+        if source.source_type.is_torrent:
+            view = self._torrent_series_view(source)
             self._apply(view, token)
             return
 
         self._apply(None, token)
 
-    def _magnet_series_view(self, source: ResolvedSource) -> SeriesView | None:
+    def _torrent_series_view(self, source: ResolvedSource) -> SeriesView | None:
         """Build the series view for the currently-open torrent.
 
         Falls back to a synthetic "all videos in torrent" view when the
         filenames don't form a series — every bundled file is intentional,
-        so the user always gets a picker for a multi-file magnet.
+        so the user always gets a picker for a multi-file torrent.
         """
         engine = _torrent_engine()
         if engine is None:
@@ -137,7 +137,7 @@ class SeriesNavigator:
         if info is None or len(info.video_files) < 2:
             return None
 
-        _, requested_sub_path = split_magnet_fragment(source.original_input)
+        _, requested_sub_path = split_torrent_fragment(source.original_input)
         current = None
         if requested_sub_path is not None:
             current = info.by_sub_path(requested_sub_path)
@@ -228,10 +228,10 @@ class SeriesNavigator:
     def _switch_to_sibling(self, sibling_name: str) -> None:
         """Play the sibling identified by ``sibling_name`` inside the current source.
 
-        For local files we just play the path next door. For magnets we
+        For local files we just play the path next door. For torrents we
         translate the filename back to its sub-path in the torrent and
         replay through the resolver — the engine's info-hash cache turns
-        the second open_magnet into a no-op so there's no metadata wait.
+        the second open_torrent into a no-op so there's no metadata wait.
         """
         source = self._current_source
         if source is None:
@@ -242,7 +242,7 @@ class SeriesNavigator:
             self._play_input(str(parent / sibling_name))
             return
 
-        if source.source_type is SourceType.MAGNET:
+        if source.source_type.is_torrent:
             engine = _torrent_engine()
             if engine is None:
                 return
@@ -255,5 +255,5 @@ class SeriesNavigator:
                 return
             # Persist the outgoing episode's position before we swap files.
             self._save_position()
-            base_uri, _ = split_magnet_fragment(source.original_input)
-            self._play_input(join_magnet_fragment(base_uri, target.sub_path))
+            base_uri, _ = split_torrent_fragment(source.original_input)
+            self._play_input(join_torrent_fragment(base_uri, target.sub_path))

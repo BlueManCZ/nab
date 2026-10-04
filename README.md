@@ -1,9 +1,10 @@
 # Nab
 
 A native GTK4/libadwaita app for watching local files, web URLs (YouTube etc.),
-and magnet links. Nab resolves and streams each source — running its own torrent
-engine for magnets — then drives mpv, which handles the actual playback in its own
-window. Everything you nab gets recorded in history.
+magnet links and `.torrent` files — on disk or straight from a URL. Nab resolves
+and streams each source — running its own torrent engine for magnets and torrents —
+then drives mpv, which handles the actual playback in its own window. Everything
+you nab gets recorded in history.
 
 ## Architecture in one paragraph
 
@@ -28,18 +29,20 @@ What works:
 - Local files and web URLs (yt-dlp) play, with title and duration shown
 - Watch history persists to SQLite at `$XDG_DATA_HOME/nab/history.db`
 - Resume position is updated every 5 seconds during playback
-- Automatic subtitle discovery for local files and magnets (via `subliminal`,
+- Automatic subtitle discovery for local files and torrents (via `subliminal`,
   free providers by default). Torrents that ship their own subtitles use those
   instead. Configure languages and optional OpenSubtitles credentials in
   `$XDG_CONFIG_HOME/nab/config.toml` (see [Subtitles](#subtitles) below).
-- Magnet / torrent streaming (via `libtorrent`): pieces are streamed to mpv
-  over a local byte-range HTTP server as they arrive. The cache directory is
-  configurable in Preferences.
+- Magnet and `.torrent` streaming (via `libtorrent`): pieces are streamed to
+  mpv over a local byte-range HTTP server as they arrive. A `.torrent` ships its
+  own metadata, so it starts without the swarm metadata wait. A `.torrent` URL
+  is downloaded to `$XDG_CACHE_HOME/nab/metainfo` first and served from there on
+  replay. The torrent cache directory is configurable in Preferences.
 - Series navigation: a prev/next + episode picker appears for on-disk series
   (`S01E01`, `01`, …) and multi-file torrents.
 
 `libtorrent` and `subliminal` are optional — Nab degrades gracefully when they
-aren't installed (magnet links and subtitle discovery are simply disabled). See
+aren't installed (torrent sources and subtitle discovery are simply disabled). See
 the `torrent` / `subtitles` extras in `pyproject.toml`.
 
 Slated for next iterations:
@@ -62,7 +65,7 @@ Everything else is Python and managed by [uv](https://docs.astral.sh/uv/).
 
 ```sh
 uv sync                  # core dependencies
-uv sync --all-extras     # also magnets (libtorrent) and subtitles (subliminal)
+uv sync --all-extras     # also torrents (libtorrent) and subtitles (subliminal)
 ```
 
 Then launch from the repo root:
@@ -71,6 +74,9 @@ Then launch from the repo root:
 uv run nab                                          # opens the controller window
 uv run nab /path/to/file.mp4                        # autoplay a local file
 uv run nab "https://www.youtube.com/watch?v=..."    # autoplay a URL
+uv run nab /path/to/release.torrent                 # stream a .torrent file
+uv run nab "https://host/release.torrent"           # or one behind a URL
+uv run nab "magnet:?xt=urn:btih:..."                # stream a magnet
 ```
 
 ## Open from a file manager
@@ -83,7 +89,8 @@ uv run scripts/install-user-desktop.py
 
 This drops `io.github.bluemancz.nab.desktop` into `~/.local/share/applications/`
 with an `Exec` line that runs the project's uv venv (`.venv/bin/python -m nab`),
-claims the common video/audio MIME types plus `x-scheme-handler/magnet`, and
+claims the common video/audio MIME types plus `application/x-bittorrent` and
+`x-scheme-handler/magnet`, and
 refreshes the desktop database. Nab then shows up in the file manager's "Open With" list and
 in app launchers. Re-run after moving the repo. Remove with `rm
 ~/.local/share/applications/io.github.bluemancz.nab.desktop`.
@@ -102,7 +109,8 @@ nab/
 ├── gtkutil.py            small shared GTK helpers (file-dialog error logging)
 ├── player.py             Player: spawns mpv with HDR flags + JSON IPC via python-mpv-jsonipc
 ├── resolver/
-│   ├── source.py         Detection: local / magnet / web / direct
+│   ├── metainfo.py       Downloads + caches a .torrent behind a URL
+│   ├── source.py         Detection: local / magnet / .torrent / web / direct
 │   └── ytdlp.py          yt-dlp wrapper
 ├── series/
 │   ├── detect.py         Pure filename-based series detection

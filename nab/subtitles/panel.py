@@ -16,7 +16,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
-from nab.resolver import ResolvedSource, SourceType  # noqa: E402
+from nab.resolver import ResolvedSource  # noqa: E402
 from nab.subtitles import (  # noqa: E402
     SubtitlesConfig,
     discover_for_source,
@@ -163,7 +163,7 @@ class SubtitlePanel:
         bundled sidecars come back untouched, being the timing everything else
         is measured against.
         """
-        if not force and source.source_type is SourceType.MAGNET:
+        if not force and source.source_type.is_torrent:
             bundled = await_bundled_subtitles(_BUNDLED_TIMEOUT, cancel)
             if bundled:
                 log.info("using %d subtitle(s) bundled in the torrent", len(bundled))
