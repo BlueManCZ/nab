@@ -1,6 +1,6 @@
 """
-Detect a "series" — a group of similarly-named files sharing one varying
-numeric axis (TV episodes, parts numbered 1..N, tracks 01..NN, etc).
+Detect a "series" — a group of similarly-named files that order themselves
+along a numeric axis (TV episodes, parts numbered 1..N, tracks 01..NN, etc).
 
 Pure functions over filenames; no filesystem I/O. The caller supplies the
 sibling list, so the same logic serves local-file directories today and
@@ -8,6 +8,18 @@ the magnet/torrent file list later.
 """
 import re
 from dataclasses import dataclass
+
+# Season/episode tokens, most explicit form first. Each yields (season,
+# episode). The `s`-form deliberately has no left word boundary so
+# `ShowS01E01.mkv` parses; the `x`-form uses digit lookarounds so a
+# resolution like `1920x1080` can't masquerade as 19x10.
+_SEASON_EPISODE_PATTERNS = (
+    re.compile(
+        r"s(?:eason)?[\s._-]*(\d{1,2})[\s._-]*e(?:p(?:isode)?)?[\s._-]*(\d{1,3})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)"),
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -40,8 +52,18 @@ def detect_series(current: str, siblings: list[str]) -> SeriesView | None:
     `siblings` must not include `current`. None is returned when no axis
     yields a group of 2+ files (including `current`).
 
-    Strategy: for each numeric run in `current`, build a regex anchoring
-    the surrounding text and count siblings that match. Two passes:
+    Pass 0 reads season/episode tokens (`S01E02`, `1x02`, `Season 1
+    Episode 2`) and, when 2+ files carry one, orders every file by
+    (season, episode). This is the only pass that spans seasons: the
+    name-shape passes below track a *single* varying number, so on a
+    complete-series torrent they can only ever describe one season — or,
+    when episode titles repeat across seasons (`S01E01.Episode.1` vs
+    `S02E01.Episode.1`), latch onto the season digit and collect just the
+    season premieres.
+
+    The remaining passes handle everything that isn't numbered by season
+    and episode. For each numeric run in `current`, build a regex
+    anchoring the surrounding text and count siblings that match:
 
     1. Strict: `prefix + (\\d+) + suffix` must match the whole sibling
        filename. Catches `S01E01.mkv` vs `S01E02.mkv`, `01.mp4` vs
@@ -54,9 +76,56 @@ def detect_series(current: str, siblings: list[str]) -> SeriesView | None:
 
     The axis with the most matches wins.
     """
-    return _try_axis(current, siblings, strict=True) or _try_axis(
-        current, siblings, strict=False
+    return (
+        _season_episode_view(current, siblings)
+        or _try_axis(current, siblings, strict=True)
+        or _try_axis(current, siblings, strict=False)
     )
+
+
+def _parse_season_episode(
+    pattern: re.Pattern[str], name: str
+) -> tuple[int, int] | None:
+    m = pattern.search(name)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _season_episode_view(
+    current: str, siblings: list[str]
+) -> SeriesView | None:
+    """Order files by their (season, episode) tokens, across seasons.
+
+    Returns None unless `current` and at least one sibling carry tokens of
+    the same form and they don't all name the same episode. `number` is the
+    episode number, so it restarts at each season boundary — it labels the
+    item, while `items` order is what navigation follows.
+    """
+    for pattern in _SEASON_EPISODE_PATTERNS:
+        current_key = _parse_season_episode(pattern, current)
+        if current_key is None:
+            continue
+
+        group = [(current_key, current)]
+        for sib in siblings:
+            key = _parse_season_episode(pattern, sib)
+            if key is not None:
+                group.append((key, sib))
+        if len({key for key, _ in group}) < 2:
+            continue
+
+        # Same episode in two qualities sorts by name, so the pair at least
+        # stays adjacent rather than interleaving with its neighbours.
+        group.sort()
+        items = tuple(
+            SeriesItem(name=name, number=episode)
+            for (_season, episode), name in group
+        )
+        current_index = next(
+            i for i, it in enumerate(items) if it.name == current
+        )
+        return SeriesView(items=items, current_index=current_index)
+
+    return None
 
 
 def _try_axis(
