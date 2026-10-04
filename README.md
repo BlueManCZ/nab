@@ -28,9 +28,9 @@ What works:
 - Local files and web URLs (yt-dlp) play, with title and duration shown
 - Watch history persists to SQLite at `$XDG_DATA_HOME/nab/history.db`
 - Resume position is updated every 5 seconds during playback
-- Automatic subtitle discovery for local movie files (via `subliminal`,
-  free providers by default). Subtitles save next to the video so future plays
-  auto-load them. Configure languages and optional OpenSubtitles credentials in
+- Automatic subtitle discovery for local files and magnets (via `subliminal`,
+  free providers by default). Torrents that ship their own subtitles use those
+  instead. Configure languages and optional OpenSubtitles credentials in
   `$XDG_CONFIG_HOME/nab/config.toml` (see [Subtitles](#subtitles) below).
 - Magnet / torrent streaming (via `libtorrent`): pieces are streamed to mpv
   over a local byte-range HTTP server as they arrive. The cache directory is
@@ -108,9 +108,11 @@ nab/
 │   ├── detect.py         Pure filename-based series detection
 │   └── nav.py            Series prev/next + episode-picker widget
 ├── subtitles/
+│   ├── bundled.py        Sidecars shipped inside a torrent
 │   ├── config.py         User preferences (TOML)
 │   ├── discover.py       Subliminal-based discovery + sub-add via IPC
-│   └── panel.py          Re-fetch-subtitles button widget
+│   ├── panel.py          Re-fetch-subtitles button widget
+│   └── sync.py           Retimes scraped subtitles to the release
 ├── history/
 │   ├── database.py       SQLite schema + upsert / update / list
 │   ├── model.py          HistoryEntry dataclass
@@ -129,6 +131,49 @@ When you play a local file, Nab kicks off a background search via
 mpv over IPC. The `.srt` is saved next to the video file so mpv auto-loads it
 on subsequent plays (no DB lookup, no Nab involvement).
 
+Magnets work the same way, with two differences:
+
+- **The torrent's own subtitles win.** If the release ships sidecars for the
+  file you're playing, Nab gives those files download priority, waits up to 20
+  seconds for them, and attaches them — they're almost always better synced
+  than anything scraped. Only if the torrent has none does it fall back to the
+  providers. Image-based tracks (VobSub, PGS) are skipped: they run to tens of
+  megabytes and would compete with the stream.
+- **Matching is on the release name, not the file.** The video in the torrent
+  cache is a partially-downloaded sparse image, so its hash means nothing;
+  the release name is what the free providers key on anyway. Scraped subtitles
+  are saved under `$XDG_CACHE_HOME/nab/subtitles/<info-hash>/` (mpv can't
+  auto-load a sidecar next to a file it's streaming over HTTP) and reused on
+  replay.
+
+Either way, the toolbar's subtitle button re-runs the provider search and
+selects the first result — use it when the automatic pick is wrong.
+
+### Sync
+
+Providers match on release *name*, which does not pin down the release's
+*cut*: a subtitle for the same episode may have been timed against a longer
+recap, an extra distributor card, or a PAL transfer, and then plays seconds or
+minutes out of step. So anything scraped gets retimed against the release
+before it reaches mpv.
+
+The reference is the release's own timing — a sidecar it shipped with, or
+failing that its muxed subtitle tracks. Only *when* is needed, never *what*,
+so an image-based track works as well as a text one: `ffprobe` reports packet
+timestamps without anything having to read the pictures, over the first 20
+minutes only, which keeps the read cheap and stays inside what a streaming
+torrent has already downloaded. Matching the two event lists is then
+one-dimensional — vote every plausible pairwise difference into a histogram,
+take the peak, and check a handful of framerate ratios in case the pace is
+off too.
+
+A subtitle is only rewritten when the winning alignment explains the data far
+better than leaving it alone does; noise, a mismatched episode, and a subtitle
+that was already in sync all read as "no answer" and the file is left exactly
+as it came. The download is kept beside it as `<name>.orig` — both as an
+undo and so that re-running corrects the timing instead of compounding it.
+Set `sync = false` to switch this off.
+
 Configuration lives at `$XDG_CONFIG_HOME/nab/config.toml`. All fields are
 optional:
 
@@ -137,6 +182,7 @@ optional:
 enabled = true            # set to false to disable discovery entirely
 languages = ["en", "cs"]  # ISO 639-1 or 639-3; first is auto-selected
 save_next_to_video = true # if false, saves to $XDG_CACHE_HOME/nab/subtitles/
+sync = true               # retime scraped subtitles to the release (see Sync)
 
 [subtitles.opensubtitles]
 # Optional. Enables the opensubtitlescom provider for better movie coverage.

@@ -18,7 +18,7 @@ dependencies = [
 # (see nab.torrent.is_available / nab.subtitles.is_available), so they're
 # extras rather than hard requirements.
 torrent = ["libtorrent>=2.0.10"]
-subtitles = ["subliminal>=2.2"]
+subtitles = ["subliminal>=2.2", "pysubs2>=1.7"]
 
 [project.scripts]
 nab = "nab.__main__:main"

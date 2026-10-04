@@ -8,6 +8,7 @@ player and a toast sink; the rest of the state lives here.
 import logging
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import gi
@@ -16,7 +17,14 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from nab.resolver import ResolvedSource, SourceType  # noqa: E402
-from nab.subtitles import SubtitlesConfig, discover_for_source, is_available  # noqa: E402
+from nab.subtitles import (  # noqa: E402
+    SubtitlesConfig,
+    discover_for_source,
+    is_available,
+    sync_to_release,
+)
+from nab.subtitles.bundled import await_bundled_subtitles  # noqa: E402
+from nab.subtitles.discover import DISCOVERABLE_SOURCE_TYPES  # noqa: E402
 
 if TYPE_CHECKING:
     from nab.player import Player
@@ -24,6 +32,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _SUBS_UNAVAILABLE_MSG = "Subtitle discovery disabled — `subliminal` not installed"
+
+# How long to give a torrent's own sidecars before falling back to scraping.
+# Only torrents that actually ship subtitles ever wait.
+_BUNDLED_TIMEOUT = 20.0
 
 
 class SubtitlePanel:
@@ -45,8 +57,9 @@ class SubtitlePanel:
         self._build_widgets()
 
     def _build_widgets(self) -> None:
-        # Force-download subtitles. Shown only for local files when subliminal
-        # is available; auto-download already skips when sidecar subs exist.
+        # Force-download subtitles. Shown for sources we can actually search
+        # (see DISCOVERABLE_SOURCE_TYPES) when subliminal is available; the
+        # auto path already skips when subtitles are present.
         self.button = Gtk.Button.new_from_icon_name("media-view-subtitles-symbolic")
         self.button.set_tooltip_text("Re-fetch subtitles")
         self.button.set_visible(False)
@@ -67,13 +80,13 @@ class SubtitlePanel:
         self.button.set_sensitive(True)
         self.spinner.stop()
         self.spinner.set_visible(False)
-        show = source.source_type is SourceType.LOCAL_FILE and is_available()
+        show = source.source_type in DISCOVERABLE_SOURCE_TYPES and is_available()
         self.button.set_visible(show)
 
     def start_discovery(self, source: ResolvedSource, *, force: bool = False) -> None:
         if not force and not self._config.enabled:
             return
-        if source.source_type is not SourceType.LOCAL_FILE:
+        if source.source_type not in DISCOVERABLE_SOURCE_TYPES:
             return
 
         if not is_available():
@@ -99,7 +112,7 @@ class SubtitlePanel:
 
         def worker():
             try:
-                paths = discover_for_source(source, self._config, cancel, force=force)
+                paths = self._collect(source, cancel, force=force)
             except Exception:
                 log.exception("subtitle discovery raised")
                 paths = []
@@ -134,6 +147,32 @@ class SubtitlePanel:
                 GLib.idle_add(self._on_added, added)
 
         threading.Thread(target=worker, name="subtitles-discover", daemon=True).start()
+
+    def _collect(
+        self, source: ResolvedSource, cancel: threading.Event, *, force: bool
+    ) -> list[Path]:
+        """Get subtitle files for `source`, preferring the ones it ships with.
+
+        A magnet's own sidecars beat scraped ones on sync, so the auto path
+        waits for them first and only falls back to the providers when the
+        torrent has none. Forcing skips straight to the providers — the
+        bundled subs are already attached by then, and "re-fetch" means the
+        user wants something other than what they're looking at.
+
+        Anything scraped is retimed against the release before it goes to mpv;
+        bundled sidecars come back untouched, being the timing everything else
+        is measured against.
+        """
+        if not force and source.source_type is SourceType.MAGNET:
+            bundled = await_bundled_subtitles(_BUNDLED_TIMEOUT, cancel)
+            if bundled:
+                log.info("using %d subtitle(s) bundled in the torrent", len(bundled))
+                return bundled
+
+        paths = discover_for_source(source, self._config, cancel, force=force)
+        if not paths or not self._config.sync or cancel.is_set():
+            return paths
+        return sync_to_release(paths, source, self._config.languages)
 
     def _set_busy(self, busy: bool) -> None:
         self.button.set_sensitive(not busy)

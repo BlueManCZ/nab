@@ -9,18 +9,38 @@ from pathlib import Path
 
 import libtorrent as lt
 
-from nab import VIDEO_EXTENSIONS
+from nab import SUBTITLE_EXTENSIONS, VIDEO_EXTENSIONS
+from nab.resolver.source import magnet_info_hash
 from nab.series import detect_series
 from nab.torrent.config import TorrentConfig
 from nab.torrent.http_server import ByteRangeServer
 
 log = logging.getLogger(__name__)
 
-_METADATA_TIMEOUT = 60
 _INITIAL_PIECES_TIMEOUT = 60
 _PIECE_WAIT_TIMEOUT = 30
+_RESUME_SAVE_TIMEOUT = 5
 
-_INFO_HASH_RE = re.compile(r"xt=urn:btih:([a-zA-Z0-9]+)", re.IGNORECASE)
+# libtorrent file priorities. The streaming file dominates; prefetched
+# episodes trickle in behind it on a low (but non-zero) priority so they
+# don't compete with playback for bandwidth. 0 means "don't download".
+_STREAM_PRIORITY = 4
+_PREFETCH_PRIORITY = 1
+# Bundled sidecars are a few hundred KB, so they ride at the top priority
+# without meaningfully competing with the stream — and a release's own subs
+# are usually better synced than anything we can scrape.
+_SUBTITLE_PRIORITY = 7
+
+# Sidecar formats we're willing to pull alongside the stream. Image-based
+# tracks (VobSub .sub/.idx, PGS .sup) run to tens of megabytes, so they're
+# excluded by extension; the size cap catches anything else oversized.
+_BUNDLED_SUBTITLE_EXTENSIONS = SUBTITLE_EXTENSIONS - {".sub", ".idx", ".sup"}
+_MAX_BUNDLED_SUBTITLE_SIZE = 4 << 20
+# Milliseconds, relative to now — set after the initial video pieces so
+# buffering the stream still wins the race.
+_SUBTITLE_PIECE_DEADLINE_MS = 2000
+
+_EPISODE_TOKEN_RE = re.compile(r"s\d{1,2}e\d{1,3}", re.IGNORECASE)
 
 ProgressCallback = Callable[[str], None]
 
@@ -37,20 +57,47 @@ def _format_size(n: int) -> str:
     return f"{n / (1 << 10):.0f} KB"
 
 
+def _plural(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _metadata_progress(s: lt.torrent_status, elapsed: float) -> str:
+    """Build the status line shown while waiting for a magnet's metadata.
+
+    The lead phrase tracks the actual phase, and distinguishes *discovered*
+    peers (found via DHT/trackers) from *connected* ones: that gap is the
+    difference between "the swarm is dead" and "we found it but can't connect",
+    which a bare connected-count hides.
+    """
+    connected, discovered = s.num_peers, s.list_peers
+    secs = f"{int(elapsed)}s"
+    if connected == 0:
+        if discovered:
+            return f"Found {_plural(discovered, 'peer')}, connecting… · {secs}"
+        return f"Searching for peers… · {secs}"
+    peers = (
+        f"{connected} of {discovered} peers"
+        if discovered > connected
+        else _plural(connected, "peer")
+    )
+    if s.num_seeds:
+        peers += f", {_plural(s.num_seeds, 'seed')}"
+    return f"Fetching metadata… {peers} · {secs}"
+
+
 def _cache_dir() -> Path:
     d = TorrentConfig.load().effective_cache_dir
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _info_hash(magnet_uri: str) -> str | None:
-    m = _INFO_HASH_RE.search(magnet_uri)
-    return m.group(1).lower() if m else None
+def _resume_path(info_hash: str) -> Path:
+    return _cache_dir() / f"{info_hash}.resume"
 
 
 @dataclass(slots=True, frozen=True)
 class TorrentFile:
-    """One video file inside a torrent, as exposed to the rest of the app."""
+    """One file inside a torrent, as exposed to the rest of the app."""
     index: int
     sub_path: str    # path inside the torrent, e.g. "Show.S01/E01.mkv"
     size: int
@@ -67,15 +114,20 @@ class TorrentStatus:
     upload_rate: int    # bytes/s
     num_peers: int      # connected peers
     num_seeds: int      # connected seeds
-    total_done: int     # wanted bytes downloaded so far
-    total_wanted: int   # bytes we want (≈ the selected file's size)
+    total_done: int     # selected-file bytes downloaded so far
+    total_wanted: int   # selected-file size in bytes
 
 
 @dataclass(slots=True, frozen=True)
 class TorrentInfo:
-    """Metadata about an open torrent. video_files is sorted by sub_path."""
+    """Metadata about an open torrent. video_files is sorted by sub_path.
+
+    ``subtitle_files`` holds the sidecars worth fetching (see
+    ``_BUNDLED_SUBTITLE_EXTENSIONS``), not every subtitle in the torrent.
+    """
     info_hash: str | None
     video_files: tuple[TorrentFile, ...]
+    subtitle_files: tuple[TorrentFile, ...] = ()
 
     def by_index(self, index: int) -> TorrentFile | None:
         return next((f for f in self.video_files if f.index == index), None)
@@ -85,6 +137,49 @@ class TorrentInfo:
 
     def by_name(self, name: str) -> TorrentFile | None:
         return next((f for f in self.video_files if f.name == name), None)
+
+
+def match_subtitle_files(
+    video: TorrentFile,
+    subtitles: tuple[TorrentFile, ...],
+    *,
+    sole_video: bool,
+) -> list[TorrentFile]:
+    """Pick the sidecars in `subtitles` that belong to `video`.
+
+    Releases label their subs in one of three ways, tried in order of how
+    specific they are:
+
+    1. Sidecar naming — ``Movie.mkv`` next to ``Movie.en.srt``.
+    2. A shared ``Subs/`` directory keyed by episode, where only the SxxEyy
+       token ties a sub back to its episode (``Subs/S01E03/2_English.srt``).
+    3. A single-video torrent, where whatever subs it ships are necessarily
+       for that video.
+
+    Returns [] when none of those apply — better no subtitles than the wrong
+    episode's.
+    """
+    if not subtitles:
+        return []
+
+    stem = Path(video.sub_path).stem.lower()
+    same_stem = [
+        s
+        for s in subtitles
+        if (sub_stem := Path(s.sub_path).stem.lower()) == stem
+        or sub_stem.startswith(f"{stem}.")
+    ]
+    if same_stem:
+        return same_stem
+
+    token = _EPISODE_TOKEN_RE.search(video.name)
+    if token is not None:
+        needle = token.group(0).lower()
+        tagged = [s for s in subtitles if needle in s.sub_path.lower()]
+        if tagged:
+            return tagged
+
+    return list(subtitles) if sole_video else []
 
 
 class TorrentEngine:
@@ -107,6 +202,7 @@ class TorrentEngine:
         self._file_offset: int = 0
         self._file_size: int = 0
         self._file_path: str = ""
+        self._subtitle_files: tuple[TorrentFile, ...] = ()
 
     def _ensure_session(self) -> lt.session:
         if self._session is not None:
@@ -121,6 +217,31 @@ class TorrentEngine:
         })
         return self._session
 
+    def _add_torrent_params(
+        self, magnet_uri: str, info_hash: str | None
+    ) -> lt.add_torrent_params:
+        """Build the params to hand ``add_torrent``.
+
+        Prefers resume data saved on a previous run: for a magnet that carries
+        the info-dict (the torrent metadata), so re-opening skips the swarm
+        metadata fetch entirely and rechecks the already-cached files locally.
+        Falls back to a bare magnet parse if there's no resume file or it's
+        unreadable (wrong version, truncated write, …).
+        """
+        if info_hash is not None:
+            path = _resume_path(info_hash)
+            if path.is_file():
+                try:
+                    params = lt.read_resume_data(path.read_bytes())
+                    params.save_path = str(_cache_dir())
+                    log.info("loaded resume data for %s", info_hash)
+                    return params
+                except Exception:
+                    log.exception("unreadable resume data %s; refetching", path)
+        params = lt.parse_magnet_uri(magnet_uri)
+        params.save_path = str(_cache_dir())
+        return params
+
     def open_magnet(
         self,
         magnet_uri: str,
@@ -128,12 +249,15 @@ class TorrentEngine:
     ) -> TorrentInfo:
         """Add the magnet to the session (if new) and return its video file list.
 
-        Blocks until metadata arrives. Cached by info-hash so re-opening
-        the same magnet is essentially free.
+        Blocks until metadata arrives. Re-opening the magnet that's already
+        open returns the in-memory file list for free. Across runs (or after
+        switching torrents), resume data saved on ``cleanup`` carries the
+        metadata back, so the metadata fetch is skipped rather than re-run
+        against a possibly-dead swarm.
         """
         progress = on_progress or _noop_progress
 
-        new_hash = _info_hash(magnet_uri)
+        new_hash = magnet_info_hash(magnet_uri)
         if (
             self._handle is not None
             and self._info is not None
@@ -147,36 +271,43 @@ class TorrentEngine:
         self.cleanup()
         ses = self._ensure_session()
 
-        params = lt.parse_magnet_uri(magnet_uri)
-        params.save_path = str(_cache_dir())
+        params = self._add_torrent_params(magnet_uri, new_hash)
         self._handle = ses.add_torrent(params)
         self._info_hash = new_hash
         h = self._handle
 
+        timeout = TorrentConfig.load().effective_metadata_timeout
         progress("Connecting to swarm…")
         log.info("waiting for torrent metadata...")
-        deadline = time.monotonic() + _METADATA_TIMEOUT
+        start = time.monotonic()
+        deadline = start + timeout
         while not h.status().has_metadata:
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if now > deadline:
                 self.cleanup()
                 raise TimeoutError(
-                    f"Timed out waiting for torrent metadata ({_METADATA_TIMEOUT}s). "
+                    f"Timed out waiting for torrent metadata ({timeout}s). "
                     "The swarm may be dead or unreachable."
                 )
-            s = h.status()
-            progress(f"Fetching metadata… ({s.num_peers} peers)")
+            progress(_metadata_progress(h.status(), now - start))
             time.sleep(0.5)
         log.info("metadata received")
 
         ti = h.torrent_file()
         fs = ti.files()
         videos: list[TorrentFile] = []
+        subtitles: list[TorrentFile] = []
         for i in range(fs.num_files()):
             sub_path = fs.file_path(i)
-            if Path(sub_path).suffix.lower() in VIDEO_EXTENSIONS:
-                videos.append(
-                    TorrentFile(index=i, sub_path=sub_path, size=fs.file_size(i))
-                )
+            size = fs.file_size(i)
+            suffix = Path(sub_path).suffix.lower()
+            if suffix in VIDEO_EXTENSIONS:
+                videos.append(TorrentFile(index=i, sub_path=sub_path, size=size))
+            elif (
+                suffix in _BUNDLED_SUBTITLE_EXTENSIONS
+                and size <= _MAX_BUNDLED_SUBTITLE_SIZE
+            ):
+                subtitles.append(TorrentFile(index=i, sub_path=sub_path, size=size))
 
         if not videos:
             names = [fs.file_path(i) for i in range(fs.num_files())]
@@ -186,8 +317,16 @@ class TorrentEngine:
             )
 
         videos.sort(key=lambda f: f.sub_path)
-        self._info = TorrentInfo(info_hash=new_hash, video_files=tuple(videos))
-        log.info("torrent has %d video file(s)", len(videos))
+        subtitles.sort(key=lambda f: f.sub_path)
+        self._info = TorrentInfo(
+            info_hash=new_hash,
+            video_files=tuple(videos),
+            subtitle_files=tuple(subtitles),
+        )
+        log.info(
+            "torrent has %d video file(s), %d bundled subtitle(s)",
+            len(videos), len(subtitles),
+        )
         return self._info
 
     def select_file(
@@ -237,7 +376,24 @@ class TorrentEngine:
         progress(f"Selecting: {title} ({_format_size(self._file_size)})")
 
         priorities = [0] * fs.num_files()
-        priorities[file_index] = 4
+        priorities[file_index] = _STREAM_PRIORITY
+        ahead = TorrentConfig.load().effective_download_ahead
+        prefetch = self._prefetch_indices(file_index, ahead)
+        for idx in prefetch:
+            priorities[idx] = _PREFETCH_PRIORITY
+        if prefetch:
+            log.info("prefetching %d upcoming file(s): %s", len(prefetch), prefetch)
+
+        self._subtitle_files = tuple(self._bundled_subtitles_for(file_index))
+        for sub in self._subtitle_files:
+            priorities[sub.index] = _SUBTITLE_PRIORITY
+        if self._subtitle_files:
+            log.info(
+                "fetching %d bundled subtitle(s): %s",
+                len(self._subtitle_files),
+                [s.sub_path for s in self._subtitle_files],
+            )
+
         h.prioritize_files(priorities)
         h.set_sequential_download(True)
 
@@ -252,6 +408,18 @@ class TorrentEngine:
             p = last_piece - i
             if 0 <= p < ti.num_pieces():
                 h.set_piece_deadline(p, 500 + i * 50)
+
+        # Sequential download would leave a sidecar stored after the video
+        # until the whole video is in. Deadline them just behind the play
+        # buffer instead, so they land seconds into playback.
+        for sub in self._subtitle_files:
+            sub_start = fs.file_offset(sub.index)
+            sub_end = sub_start + max(sub.size, 1) - 1
+            for p in range(
+                sub_start // self._piece_length, sub_end // self._piece_length + 1
+            ):
+                if 0 <= p < ti.num_pieces():
+                    h.set_piece_deadline(p, _SUBTITLE_PIECE_DEADLINE_MS)
 
         log.info("waiting for first piece...")
         deadline = time.monotonic() + _INITIAL_PIECES_TIMEOUT
@@ -270,6 +438,37 @@ class TorrentEngine:
         self._server = ByteRangeServer(self._file_path, self._file_size, self)
         url = self._server.start()
         return url, title
+
+    def _prefetch_indices(self, current_index: int, count: int) -> list[int]:
+        """File indices of the next ``count`` videos to download ahead.
+
+        Ordered the way the series navigator orders episodes — by the detected
+        numeric axis (S01E01, S01E02, …) when there is one, else by the
+        torrent's sub-path order — so "download ahead" lines up with "what
+        plays next". Returns fewer than ``count`` near the end of the series,
+        and an empty list when prefetch is off or the open torrent doesn't
+        recognise the current file.
+        """
+        info = self._info
+        if info is None or count <= 0:
+            return []
+        files = info.video_files
+        current = info.by_index(current_index)
+        if current is None:
+            return []
+
+        names = [f.name for f in files]
+        view = detect_series(current.name, [n for n in names if n != current.name])
+        if view is not None:
+            upcoming = []
+            for item in view.items[view.current_index + 1 : view.current_index + 1 + count]:
+                f = info.by_name(item.name)
+                if f is not None and f.index != current_index:
+                    upcoming.append(f.index)
+            return upcoming
+
+        pos = files.index(current)
+        return [f.index for f in files[pos + 1 : pos + 1 + count]]
 
     def default_file_index(self, info: TorrentInfo) -> int:
         """Pick a sensible file to play when the user only gave us the magnet URI.
@@ -304,6 +503,53 @@ class TorrentEngine:
 
         return max(info.video_files, key=lambda f: f.size).index
 
+    def _bundled_subtitles_for(self, file_index: int) -> list[TorrentFile]:
+        """Sidecars in the torrent belonging to the file at `file_index`."""
+        info = self._info
+        if info is None:
+            return []
+        video = info.by_index(file_index)
+        if video is None:
+            return []
+        return match_subtitle_files(
+            video,
+            info.subtitle_files,
+            sole_video=len(info.video_files) == 1,
+        )
+
+    def bundled_subtitles(self) -> tuple[TorrentFile, ...]:
+        """Sidecars being fetched for the active file (empty if none apply)."""
+        return self._subtitle_files
+
+    def completed_bundled_subtitles(self) -> list[Path]:
+        """On-disk paths of the active file's sidecars that finished downloading.
+
+        A partially-written subtitle would hand mpv a truncated file, so a
+        sidecar has to be both fully downloaded *and* fully on disk — piece
+        completion runs slightly ahead of libtorrent's disk thread. Safe to
+        call from any thread.
+        """
+        h = self._handle
+        if h is None or not self._subtitle_files:
+            return []
+        try:
+            progress = h.file_progress()
+        except RuntimeError:
+            return []  # handle removed under us (raced with cleanup)
+
+        cache = _cache_dir()
+        done: list[Path] = []
+        for sub in self._subtitle_files:
+            if sub.index >= len(progress) or progress[sub.index] < sub.size:
+                continue
+            path = cache / sub.sub_path
+            try:
+                if path.stat().st_size >= sub.size:
+                    done.append(path)
+            except OSError:
+                continue  # not written out yet
+        return done
+
     def current_info(self) -> TorrentInfo | None:
         """Return the open torrent's info, or None if nothing is open."""
         return self._info
@@ -311,6 +557,14 @@ class TorrentEngine:
     def current_file_index(self) -> int:
         """Return the active file's index in the open torrent, or -1."""
         return self._file_index
+
+    def current_file_path(self) -> Path | None:
+        """Return the active file's path in the torrent cache, or None.
+
+        The file is sparse while the torrent streams, so this is only good for
+        reads that stay inside what has already landed.
+        """
+        return Path(self._file_path) if self._file_path else None
 
     def live_status(self) -> TorrentStatus | None:
         """Snapshot the open torrent's transfer stats, or None if nothing's open.
@@ -323,6 +577,7 @@ class TorrentEngine:
             return None
         try:
             s = h.status()
+            total_done = self._selected_file_done(h)
         except RuntimeError:
             return None
         return TorrentStatus(
@@ -330,9 +585,35 @@ class TorrentEngine:
             upload_rate=s.upload_rate,
             num_peers=s.num_peers,
             num_seeds=s.num_seeds,
-            total_done=s.total_done,
-            total_wanted=s.total_wanted,
+            total_done=total_done,
+            total_wanted=self._file_size,
         )
+
+    def _selected_file_done(self, h: lt.torrent_handle) -> int:
+        """Return downloaded bytes for the currently selected file."""
+        if (
+            self._file_index < 0
+            or self._file_size <= 0
+            or self._piece_length <= 0
+        ):
+            return 0
+
+        first_piece = self._file_offset // self._piece_length
+        last_piece = (self._file_offset + self._file_size - 1) // self._piece_length
+        file_start = self._file_offset
+        file_end = self._file_offset + self._file_size
+        done = 0
+
+        for piece in range(first_piece, last_piece + 1):
+            if not h.have_piece(piece):
+                continue
+            piece_start = piece * self._piece_length
+            piece_end = piece_start + self._piece_length
+            overlap_start = max(file_start, piece_start)
+            overlap_end = min(file_end, piece_end)
+            done += max(0, overlap_end - overlap_start)
+
+        return min(done, self._file_size)
 
     def pieces_for_range(self, file_offset: int, length: int) -> range:
         """Return piece indices covering a byte range within the video file.
@@ -374,11 +655,42 @@ class TorrentEngine:
             log.info("torrent handle gone during wait_for_piece: %s", exc)
             return False
 
+    def _save_resume_data(self) -> None:
+        """Persist resume data (including the info-dict) for the open torrent.
+
+        Best-effort: keyed by info-hash in the cache dir, this lets the next
+        ``open_magnet`` skip the metadata fetch and the full piece re-hash.
+        Blocks briefly waiting for libtorrent's alert; never raises.
+        """
+        h, ses = self._handle, self._session
+        if h is None or ses is None or not self._info_hash:
+            return
+        try:
+            if not h.status().has_metadata:
+                return  # nothing worth saving yet
+            h.save_resume_data(lt.torrent_handle.save_info_dict)
+            deadline = time.monotonic() + _RESUME_SAVE_TIMEOUT
+            while time.monotonic() < deadline:
+                ses.wait_for_alert(200)
+                for a in ses.pop_alerts():
+                    if isinstance(a, lt.save_resume_data_alert):
+                        path = _resume_path(self._info_hash)
+                        path.write_bytes(lt.write_resume_data_buf(a.params))
+                        log.info("saved resume data: %s", path)
+                        return
+                    if isinstance(a, lt.save_resume_data_failed_alert):
+                        log.info("resume data save skipped: %s", a.message())
+                        return
+            log.info("timed out saving resume data for %s", self._info_hash)
+        except Exception:
+            log.exception("failed to save resume data")
+
     def cleanup(self) -> None:
         """Stop serving and remove the torrent from the session (files stay cached)."""
         if self._server is not None:
             self._server.stop()
             self._server = None
+        self._save_resume_data()
         if self._handle is not None and self._session is not None:
             try:
                 self._session.remove_torrent(self._handle)
@@ -392,6 +704,7 @@ class TorrentEngine:
         self._file_offset = 0
         self._file_size = 0
         self._file_path = ""
+        self._subtitle_files = ()
 
     def shutdown(self) -> None:
         """Tear down the engine completely (call on app exit)."""

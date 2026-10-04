@@ -3,19 +3,30 @@ import threading
 from collections.abc import Callable
 from functools import cache, wraps
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from nab import SUBTITLE_EXTENSIONS
 from nab.paths import cache_home
 from nab.resolver import ResolvedSource, SourceType
+from nab.resolver.source import magnet_info_hash, split_magnet_fragment
 from nab.subtitles.config import SubtitlesConfig
+
+if TYPE_CHECKING:
+    from subliminal import Video
 
 log = logging.getLogger(__name__)
 
+# What a planner hands back: the video to search on plus where to save
+# (None meaning "next to the video"), a ready-made list of subtitles that
+# make searching unnecessary, or None to skip this source entirely.
+type SearchPlan = tuple["Video", Path | None] | list[Path] | None
+
 _FREE_PROVIDERS = ["podnapisi", "gestdown", "tvsubtitles"]
 
-_SUBTITLE_EXTS = frozenset({
-    ".srt", ".ass", ".ssa", ".vtt", ".webvtt",
-    ".sub", ".sbv", ".idx", ".sup",
-})
+# Source types we can look subtitles up for. Local files are scanned off
+# disk; magnets are matched on their release name. A web/direct URL gives us
+# neither a file to hash nor a reliable release name, so it's out.
+DISCOVERABLE_SOURCE_TYPES = frozenset({SourceType.LOCAL_FILE, SourceType.MAGNET})
 
 
 def _once(fn: Callable[[], None]) -> Callable[[], None]:
@@ -40,21 +51,31 @@ def _once(fn: Callable[[], None]) -> Callable[[], None]:
     return wrapper
 
 
-def has_existing_subtitles(video_path: Path) -> bool:
-    """True if a sidecar subtitle file already exists for `video_path`."""
-    stem_prefix = video_path.stem.lower() + "."
+def sidecar_subtitles(directory: Path, stem: str) -> list[Path]:
+    """Subtitle files in `directory` named for a video with `stem`.
+
+    Matches both the bare `<stem>.srt` and the language-tagged
+    `<stem>.en.srt` that subliminal writes.
+    """
+    prefix = stem.lower()
+    found: list[Path] = []
     try:
-        for sibling in video_path.parent.iterdir():
+        for sibling in directory.iterdir():
             if not sibling.is_file():
                 continue
-            name = sibling.name.lower()
-            if not name.startswith(stem_prefix):
+            if sibling.suffix.lower() not in SUBTITLE_EXTENSIONS:
                 continue
-            if sibling.suffix.lower() in _SUBTITLE_EXTS:
-                return True
+            sub_stem = sibling.stem.lower()
+            if sub_stem == prefix or sub_stem.startswith(f"{prefix}."):
+                found.append(sibling)
     except OSError:
-        return False
-    return False
+        return []
+    return sorted(found)
+
+
+def has_existing_subtitles(video_path: Path) -> bool:
+    """True if a sidecar subtitle file already exists for `video_path`."""
+    return bool(sidecar_subtitles(video_path.parent, video_path.stem))
 
 
 @cache
@@ -108,10 +129,87 @@ def _parse_language(code: str):
         return None
 
 
-def _subs_cache_dir() -> Path:
+def _subs_cache_dir(key: str | None = None) -> Path:
+    """The directory cached subtitles live in, optionally scoped by `key`.
+
+    Magnets pass their info-hash: the file inside a torrent is often named
+    something generic (`movie.mkv`), and a flat cache would hand one film's
+    subtitles to the next one with the same inner filename.
+    """
     d = cache_home() / "subtitles"
+    if key:
+        d /= key
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _release_name(source: ResolvedSource) -> str | None:
+    """The magnet's in-torrent path, which is what guessit reads best.
+
+    Prefers the full `#file=` sub-path over the bare filename: the parent
+    directory usually carries the release name (`Movie.2023.1080p-GRP/`),
+    and guessit uses that context when the filename alone is thin.
+    """
+    _, sub_path = split_magnet_fragment(source.original_input)
+    return sub_path or source.title
+
+
+def _plan_local(
+    source: ResolvedSource, config: SubtitlesConfig, force: bool
+) -> SearchPlan:
+    """Build the search plan for a local file."""
+    from subliminal import scan_video
+
+    video_path = Path(source.playable_url)
+    if not video_path.is_file():
+        return None
+
+    if not force and has_existing_subtitles(video_path):
+        log.info("subtitles already present for %s; skipping auto-download", video_path.name)
+        return []
+
+    try:
+        video = scan_video(str(video_path))
+    except Exception:
+        log.exception("scan_video failed for %s", video_path)
+        return None
+
+    # Next to the video by default so mpv auto-loads the sidecar on replay.
+    return video, (None if config.save_next_to_video else _subs_cache_dir())
+
+
+def _plan_magnet(source: ResolvedSource, force: bool) -> SearchPlan:
+    """Build the search plan for a magnet.
+
+    Matches on the release name rather than scanning the file: the torrent
+    cache holds a partially-downloaded sparse image whose hash is meaningless,
+    and the providers we query are name-based anyway. That also means this can
+    run before a single byte has landed.
+
+    Subtitles always go to the cache dir — mpv can't auto-load a sidecar next
+    to a file it's streaming over HTTP, and writing into the torrent cache
+    would lose them the next time the user clears it.
+    """
+    from subliminal import Video
+
+    release = _release_name(source)
+    if not release:
+        return None
+
+    save_dir = _subs_cache_dir(magnet_info_hash(source.original_input))
+    if not force:
+        cached = sidecar_subtitles(save_dir, Path(release).stem)
+        if cached:
+            log.info("reusing %d cached subtitle(s) for %s", len(cached), release)
+            return cached
+
+    try:
+        video = Video.fromname(release)
+    except Exception:
+        log.info("couldn't parse a title out of %r; skipping subtitles", release)
+        return None
+
+    return video, save_dir
 
 
 def discover_for_source(
@@ -128,32 +226,29 @@ def discover_for_source(
     """
     if not force and not config.enabled:
         return []
-    if source.source_type is not SourceType.LOCAL_FILE:
+    if source.source_type not in DISCOVERABLE_SOURCE_TYPES:
         return []
 
     try:
-        from subliminal import download_best_subtitles, scan_video
+        from subliminal import download_best_subtitles
     except ImportError:
         _warn_missing()
         return []
 
-    video_path = Path(source.playable_url)
-    if not video_path.exists() or not video_path.is_file():
+    plan = (
+        _plan_local(source, config, force)
+        if source.source_type is SourceType.LOCAL_FILE
+        else _plan_magnet(source, force)
+    )
+    if plan is None:
         return []
-
-    if not force and has_existing_subtitles(video_path):
-        log.info("subtitles already present for %s; skipping auto-download", video_path.name)
-        return []
+    if isinstance(plan, list):
+        return plan  # already satisfied, no search needed
+    video, save_dir = plan
 
     _configure_cache()
 
     if cancel_token is not None and cancel_token.is_set():
-        return []
-
-    try:
-        video = scan_video(str(video_path))
-    except Exception:
-        log.exception("scan_video failed for %s", video_path)
         return []
 
     languages = {lang for lang in (_parse_language(c) for c in config.languages) if lang}
@@ -181,20 +276,19 @@ def discover_for_source(
             provider_configs=provider_configs,
         )
     except Exception:
-        log.exception("subliminal download failed for %s", video_path)
+        log.exception("subliminal download failed for %s", video.name)
         return []
 
     found = result.get(video, [])
     if not found:
-        log.info("no subtitles found for %s", video_path.name)
+        log.info("no subtitles found for %s", video.name)
         return []
 
     if cancel_token is not None and cancel_token.is_set():
         return []
 
-    # Save next to the video by default so mpv auto-loads the sidecar on
-    # replay; if that directory isn't writable, fall back to the cache dir.
-    save_dir: Path | None = None if config.save_next_to_video else _subs_cache_dir()
+    # `save_dir is None` means "next to the video"; if that directory isn't
+    # writable, fall back to the cache dir.
     saved = _save_subtitles(video, found, save_dir)
     if not saved and save_dir is None:
         log.info("subtitle save next to video failed; retrying in cache dir")

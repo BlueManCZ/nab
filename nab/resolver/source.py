@@ -1,4 +1,5 @@
 import logging
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -11,6 +12,17 @@ log = logging.getLogger(__name__)
 
 
 _MAGNET_FRAGMENT = "#file="
+_INFO_HASH_RE = re.compile(r"xt=urn:btih:([a-zA-Z0-9]+)", re.IGNORECASE)
+
+
+def magnet_info_hash(magnet_uri: str) -> str | None:
+    """The info-hash a magnet URI points at, lowercased, or None if malformed.
+
+    This is the torrent's stable identity, so it also serves as a per-torrent
+    key for anything cached on disk.
+    """
+    m = _INFO_HASH_RE.search(magnet_uri)
+    return m.group(1).lower() if m else None
 
 
 def split_magnet_fragment(uri: str) -> tuple[str, str | None]:

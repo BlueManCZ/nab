@@ -276,7 +276,6 @@ wheels = [
 
 [[package]]
 name = "nab"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "pygobject" },
@@ -287,6 +286,7 @@ dependencies = [
 
 [package.optional-dependencies]
 subtitles = [
+    { name = "pysubs2" },
     { name = "subliminal" },
 ]
 torrent = [
@@ -297,12 +297,13 @@ torrent = [
 requires-dist = [
     { name = "libtorrent", marker = "extra == 'torrent'", specifier = ">=2.0.10" },
     { name = "pygobject", specifier = ">=3.50" },
+    { name = "pysubs2", marker = "extra == 'subtitles'", specifier = ">=1.7" },
     { name = "python-mpv-jsonipc", specifier = ">=1.2.2" },
     { name = "subliminal", marker = "extra == 'subtitles'", specifier = ">=2.2" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "yt-dlp", specifier = ">=2025.1.1" },
 ]
-provides-extras = ["torrent", "subtitles"]
+provides-extras = ["subtitles", "torrent"]
 
 [[package]]
 name = "platformdirs"

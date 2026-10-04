@@ -17,6 +17,7 @@ class SubtitlesConfig:
         enabled = true
         languages = ["en", "cs"]
         save_next_to_video = true
+        sync = true
 
         [subtitles.opensubtitles]
         username = "..."
@@ -26,6 +27,7 @@ class SubtitlesConfig:
     enabled: bool = True
     languages: list[str] = field(default_factory=lambda: ["en"])
     save_next_to_video: bool = True
+    sync: bool = True
     opensubtitles_username: str | None = None
     opensubtitles_password: str | None = None
 
@@ -41,6 +43,7 @@ class SubtitlesConfig:
             enabled=bool(sub.get("enabled", True)),
             languages=[str(x) for x in languages],
             save_next_to_video=bool(sub.get("save_next_to_video", True)),
+            sync=bool(sub.get("sync", True)),
             opensubtitles_username=os_sub.get("username"),
             opensubtitles_password=os_sub.get("password"),
         )
