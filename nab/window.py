@@ -14,6 +14,7 @@ from nab import MEDIA_EXTENSIONS  # noqa: E402
 from nab.gtkutil import log_dialog_error  # noqa: E402
 from nab.history import HistoryDatabase  # noqa: E402
 from nab.history.sidebar import HistorySidebar  # noqa: E402
+from nab.playback import PlaybackConfig  # noqa: E402
 from nab.player import Player  # noqa: E402
 from nab.resolver import ResolvedSource, SourceType, resolve  # noqa: E402
 from nab.resolver.source import magnet_for_cache_path  # noqa: E402
@@ -30,6 +31,9 @@ _RESUME_MIN_SECONDS = 5.0
 _POSITION_SAVE_INTERVAL = 5
 # How often to refresh the live torrent stats widget on the now-playing card.
 _TORRENT_STATS_INTERVAL = 1
+# Debounce window for persisting the volume; the slider fires continuously
+# while dragged, so we coalesce writes to config.toml.
+_VOLUME_SAVE_DELAY_MS = 500
 
 
 def _format_time(seconds: float | None) -> str:
@@ -95,8 +99,10 @@ class NabWindow(Adw.ApplicationWindow):
         self._is_paused: bool = True
         self._seek_guard = _UpdateGuard()
         self._volume_guard = _UpdateGuard()
+        self._playback_config = PlaybackConfig.load()
         self._save_position_source: int | None = None
         self._torrent_stats_source: int | None = None
+        self._volume_save_source: int | None = None
         # mpv is started on demand (and re-started after the user closes its
         # window). _pending_source holds what to play once a freshly-spawned
         # mpv is ready; _mpv_starting guards against spawning two at once.
@@ -252,7 +258,12 @@ class NabWindow(Adw.ApplicationWindow):
 
         vol_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic")
         bar.append(vol_icon)
-        self.volume_adjustment = Gtk.Adjustment(lower=0, upper=100, value=80, step_increment=5)
+        self.volume_adjustment = Gtk.Adjustment(
+            lower=0,
+            upper=100,
+            value=self._playback_config.effective_volume,
+            step_increment=5,
+        )
         self.volume_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.volume_adjustment)
         self.volume_scale.set_draw_value(False)
         self.volume_scale.set_size_request(120, -1)
@@ -376,6 +387,10 @@ class NabWindow(Adw.ApplicationWindow):
         if self._save_position_source is not None:
             GLib.source_remove(self._save_position_source)
             self._save_position_source = None
+        if self._volume_save_source is not None:
+            GLib.source_remove(self._volume_save_source)
+            self._volume_save_source = None
+            self._save_volume_now(self.volume_adjustment.get_value())
         self._stop_torrent_stats()
         # Ask mpv to quit, then drop it. _teardown_mpv nulls self.player, so
         # the disconnect this provokes is recognised as stale and ignored.
@@ -748,9 +763,30 @@ class NabWindow(Adw.ApplicationWindow):
         self.play_pause_button.set_icon_name(icon)
 
     def _on_volume_changed(self, scale: Gtk.Scale) -> None:
-        if self._volume_guard or self.player is None:
+        # mpv echoing a volume back travels through _apply_volume under the
+        # guard, so this only runs for genuine user changes. We still persist
+        # even when no player is up, so a pre-playback tweak survives.
+        if self._volume_guard:
             return
-        self.player.set_property("volume", scale.get_value())
+        if self.player is not None:
+            self.player.set_property("volume", scale.get_value())
+        self._schedule_volume_save(scale.get_value())
+
+    def _schedule_volume_save(self, volume: float) -> None:
+        if self._volume_save_source is not None:
+            GLib.source_remove(self._volume_save_source)
+        self._volume_save_source = GLib.timeout_add(
+            _VOLUME_SAVE_DELAY_MS, self._save_volume_now, volume
+        )
+
+    def _save_volume_now(self, volume: float) -> bool:
+        self._volume_save_source = None
+        self._playback_config.volume = volume
+        try:
+            self._playback_config.save()
+        except OSError:
+            log.exception("failed to persist volume")
+        return False
 
     def _on_seek_value_changed(self, adjustment: Gtk.Adjustment) -> None:
         if self._seek_guard or self.player is None:
