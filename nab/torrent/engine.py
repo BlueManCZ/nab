@@ -23,7 +23,7 @@ _PIECE_WAIT_TIMEOUT = 30
 _RESUME_SAVE_TIMEOUT = 5
 
 # libtorrent file priorities. The streaming file dominates; prefetched
-# episodes trickle in behind it on a low (but non-zero) priority so they
+# episodes queue up behind it on a low (but non-zero) priority so they
 # don't compete with playback for bandwidth. 0 means "don't download".
 _STREAM_PRIORITY = 4
 _PREFETCH_PRIORITY = 1
@@ -211,6 +211,20 @@ class TorrentStatus:
     total_wanted: int   # selected-file size in bytes
 
 
+@dataclass(slots=True, frozen=True)
+class BackgroundStatus:
+    """Progress of a torrent finishing its queue with nothing streaming."""
+    source: str                     # the torrent source it was opened from
+    name: str                       # the torrent's own name
+    pending: tuple[TorrentFile, ...]  # unfinished videos, next to download first
+    download_rate: int  # bytes/s
+    upload_rate: int    # bytes/s
+    num_peers: int      # connected peers
+    total_done: int     # queued-file bytes downloaded so far
+    total_wanted: int   # queued-file size in bytes
+    finished: bool      # the whole queue is in
+
+
 def match_subtitle_files(
     video: TorrentFile,
     subtitles: tuple[TorrentFile, ...],
@@ -261,7 +275,9 @@ class TorrentEngine:
     .torrent file — and returns its file list; ``select_file`` switches the
     active file inside the open torrent and starts (or restarts) the HTTP
     server. Re-opening the torrent that's already open returns the cached file
-    list without re-adding it.
+    list without re-adding it. ``release_stream`` ends the stream but keeps the
+    torrent loaded until its queued files are in — ``select_file`` picks it back
+    up from there, and opening a different torrent replaces it.
     """
 
     def __init__(self):
@@ -269,6 +285,8 @@ class TorrentEngine:
         self._handle: lt.torrent_handle | None = None
         self._info: TorrentInfo | None = None
         self._info_hash: str | None = None
+        self._uri: str | None = None
+        self._background: bool = False
         self._server: ByteRangeServer | None = None
         self._file_index: int = -1
         self._piece_length: int = 0
@@ -392,6 +410,7 @@ class TorrentEngine:
             )
 
         self._info = info
+        self._uri = uri
         log.info(
             "torrent has %d video file(s), %d bundled subtitle(s)",
             len(info.video_files), len(info.subtitle_files),
@@ -427,9 +446,7 @@ class TorrentEngine:
         # Stop the old server before reprioritising. A late HTTP range
         # request reading from the old file after we've zeroed its pieces
         # would block forever in wait_for_piece.
-        if self._server is not None:
-            self._server.stop()
-            self._server = None
+        self._stop_server()
 
         self._file_index = file_index
         self._piece_length = ti.piece_length()
@@ -506,6 +523,7 @@ class TorrentEngine:
         progress("Starting stream…")
         self._server = ByteRangeServer(self._file_path, self._file_size, self)
         url = self._server.start()
+        self._background = False
         return url, title
 
     def _prefetch_indices(self, current_index: int, count: int) -> list[int]:
@@ -754,11 +772,84 @@ class TorrentEngine:
         except Exception:
             log.exception("failed to save resume data")
 
-    def cleanup(self) -> None:
-        """Stop serving and remove the torrent from the session (files stay cached)."""
+    def release_stream(self) -> None:
+        """End the stream, leaving the torrent to finish what it has queued.
+
+        The active file and the episodes prefetched behind it keep the
+        priorities ``select_file`` gave them, so they carry on downloading with
+        nothing playing. A torrent still being opened has no queue yet — every
+        file is wanted by default — so it's dropped instead of fetched whole.
+        """
+        h = self._handle
+        if h is None or self._background:
+            return
+        if self._file_index < 0:
+            self.cleanup()
+            return
+        self._stop_server()
+        self._forget_stream()
+        self._background = True
+        try:
+            h.clear_piece_deadlines()  # nobody's waiting on those pieces now
+        except RuntimeError as exc:
+            log.info("torrent handle gone during release_stream: %s", exc)
+        log.info("stream released; finishing %s in the background", self._info_hash)
+
+    def background_status(self) -> BackgroundStatus | None:
+        """Snapshot the queue being finished, or None if that isn't happening.
+
+        Safe to call from any thread. Returns None if the handle was removed
+        under us (raced with ``cleanup()``).
+        """
+        h, info, uri = self._handle, self._info, self._uri
+        if not self._background or h is None or info is None or uri is None:
+            return None
+        try:
+            s = h.status()
+            priorities = h.get_file_priorities()
+            progress = h.file_progress()
+        except RuntimeError:
+            return None
+        pending = [
+            f
+            for f in info.video_files
+            if priorities[f.index] > 0 and progress[f.index] < f.size
+        ]
+        pending.sort(key=lambda f: priorities[f.index], reverse=True)
+        return BackgroundStatus(
+            source=uri,
+            name=info.name,
+            pending=tuple(pending),
+            download_rate=s.download_rate,
+            upload_rate=s.upload_rate,
+            num_peers=s.num_peers,
+            total_done=s.total_wanted_done,
+            total_wanted=s.total_wanted,
+            finished=s.is_finished,
+        )
+
+    def drop_background(self) -> None:
+        """Remove the torrent if it's only finishing its queue (files stay cached)."""
+        if self._background:
+            self.cleanup()
+
+    def _stop_server(self) -> None:
         if self._server is not None:
             self._server.stop()
             self._server = None
+
+    def _forget_stream(self) -> None:
+        """Clear everything describing the file being streamed."""
+        self._file_index = -1
+        self._piece_length = 0
+        self._file_offset = 0
+        self._file_size = 0
+        self._file_path = ""
+        self._subtitle_files = ()
+
+    def cleanup(self) -> None:
+        """Stop serving and remove the torrent from the session (files stay cached)."""
+        self._stop_server()
         self._save_resume_data()
         if self._handle is not None and self._session is not None:
             try:
@@ -768,12 +859,9 @@ class TorrentEngine:
             self._handle = None
         self._info = None
         self._info_hash = None
-        self._file_index = -1
-        self._piece_length = 0
-        self._file_offset = 0
-        self._file_size = 0
-        self._file_path = ""
-        self._subtitle_files = ()
+        self._uri = None
+        self._background = False
+        self._forget_stream()
 
     def shutdown(self) -> None:
         """Tear down the engine completely (call on app exit)."""
@@ -791,9 +879,14 @@ def get_engine() -> TorrentEngine:
     return _engine
 
 
-def cleanup_engine() -> None:
+def release_engine_stream() -> None:
     if _engine is not None:
-        _engine.cleanup()
+        _engine.release_stream()
+
+
+def drop_engine_background() -> None:
+    if _engine is not None:
+        _engine.drop_background()
 
 
 def engine_status() -> TorrentStatus | None:
@@ -801,6 +894,13 @@ def engine_status() -> TorrentStatus | None:
     if _engine is None:
         return None
     return _engine.live_status()
+
+
+def engine_background_status() -> BackgroundStatus | None:
+    """Progress of the queue the engine is finishing, or None."""
+    if _engine is None:
+        return None
+    return _engine.background_status()
 
 
 def shutdown_engine() -> None:

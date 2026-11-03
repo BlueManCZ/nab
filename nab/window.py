@@ -16,12 +16,13 @@ from nab.history import HistoryDatabase  # noqa: E402
 from nab.history.sidebar import HistorySidebar  # noqa: E402
 from nab.library.store import LibraryStore  # noqa: E402
 from nab.library.view import LibraryView  # noqa: E402
-from nab.nowplaying import NowPlayingBar  # noqa: E402
+from nab.nowplaying import BackgroundDownloadBar, NowPlayingBar  # noqa: E402
 from nab.playback import PlaybackConfig  # noqa: E402
 from nab.player import Player  # noqa: E402
 from nab.resolver import ResolvedSource, resolve  # noqa: E402
 from nab.resolver.source import (  # noqa: E402
     TORRENT_FILE_SUFFIX,
+    join_torrent_fragment,
     split_torrent_fragment,
     torrent_for_cache_path,
 )
@@ -67,6 +68,15 @@ def _engine_status():
         return None
     from nab.torrent.engine import engine_status
     return engine_status()
+
+
+def _engine_background_status():
+    """What the shared engine is finishing in the background, or None."""
+    from nab.torrent import is_available
+    if not is_available():
+        return None
+    from nab.torrent.engine import engine_background_status
+    return engine_background_status()
 
 
 class _UpdateGuard:
@@ -116,6 +126,7 @@ class NabWindow(Adw.ApplicationWindow):
         self._playback_config = PlaybackConfig.load()
         self._save_position_source: int | None = None
         self._torrent_stats_source: int | None = None
+        self._background_download_source: int | None = None
         self._volume_save_source: int | None = None
         # mpv is started on demand (and re-started after the user closes its
         # window). _pending_source holds what to play once a freshly-spawned
@@ -133,6 +144,9 @@ class NabWindow(Adw.ApplicationWindow):
             show_toast=self._show_toast,
         )
         self.now_playing = NowPlayingBar(on_open=self._on_now_playing_open)
+        self.background_download = BackgroundDownloadBar(
+            on_cancel=self._cancel_background_download
+        )
 
         self._build_ui()
         # No mpv yet — its window only opens once there's something to play.
@@ -176,6 +190,7 @@ class NabWindow(Adw.ApplicationWindow):
             cache_dir=_torrent_cache_dir,
         )
         bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bottom.append(self.background_download.widget)
         bottom.append(self.now_playing.widget)
         bottom.append(self._build_controls())
 
@@ -346,6 +361,7 @@ class NabWindow(Adw.ApplicationWindow):
         self._pending_source = None
         self.now_playing.show("Couldn't start mpv", msg)
         self._show_toast(f"Couldn't start mpv: {msg}", timeout=6)
+        self._release_torrent()
         return False
 
     def _on_mpv_disconnected(self, player: Player) -> bool:
@@ -359,7 +375,7 @@ class NabWindow(Adw.ApplicationWindow):
             return False
         log.info("mpv window closed — stopping playback")
         self._save_position_now(False)
-        self._teardown_torrent(full=False)
+        self._release_torrent()
         self._teardown_mpv()
         self._enter_stopped_state()
         return False
@@ -404,6 +420,7 @@ class NabWindow(Adw.ApplicationWindow):
             self._volume_save_source = None
             self._save_volume_now(self.volume_adjustment.get_value())
         self._stop_torrent_stats()
+        self._stop_background_download_watch()
         # Ask mpv to quit, then drop it. _teardown_mpv nulls self.player, so
         # the disconnect this provokes is recognised as stale and ignored.
         if self.player is not None:
@@ -412,20 +429,28 @@ class NabWindow(Adw.ApplicationWindow):
             except Exception:
                 pass
         self._teardown_mpv()
-        self._teardown_torrent(full=True)
+        self._teardown_torrent()
 
-    def _teardown_torrent(self, *, full: bool) -> None:
-        """Release torrent resources, if libtorrent is even in use.
+    def _teardown_torrent(self) -> None:
+        """Tear the whole torrent engine down (app exit).
 
-        `full=True` tears the whole engine down (app exit); otherwise it just
-        stops serving the current torrent. No-op when libtorrent isn't
-        installed — which is also why the engine import is guarded.
+        No-op when libtorrent isn't installed — which is also why the engine
+        import is guarded.
         """
         from nab.torrent import is_available
         if not is_available():
             return
-        from nab.torrent.engine import cleanup_engine, shutdown_engine
-        (shutdown_engine if full else cleanup_engine)()
+        from nab.torrent.engine import shutdown_engine
+        shutdown_engine()
+
+    def _release_torrent(self) -> None:
+        """End the torrent stream, leaving its queue to finish in the background."""
+        from nab.torrent import is_available
+        if not is_available():
+            return
+        from nab.torrent.engine import release_engine_stream
+        release_engine_stream()
+        self._sync_background_download()
 
     def _on_close_request(self, _w) -> bool:
         self.shutdown_player()
@@ -483,6 +508,9 @@ class NabWindow(Adw.ApplicationWindow):
         # A previous torrent may still be polling stats into the strip; silence
         # it so resolve-progress and "Starting mpv…" messages aren't overwritten.
         self._stop_torrent_stats()
+        # The resolver may take over the engine's torrent from its own thread,
+        # so hands off it until that's settled (see _sync_background_download).
+        self._stop_background_download_watch()
         if not recovering:
             self.now_playing.show(
                 self.library.describe(text) or "Nabbing…", "Resolving…", busy=True
@@ -560,10 +588,14 @@ class NabWindow(Adw.ApplicationWindow):
         self._set_resolving(False)
         if self.player is None or not self.player.running:
             self.now_playing.hide()
-        elif self._current_source is not None:
-            # Whatever was playing before the failed nab still is.
-            self._show_now_playing(self._current_source)
-            self.now_playing.set_status("Playing in mpv's window")
+            # Nothing will play what the failed nab may have left open.
+            self._release_torrent()
+        else:
+            if self._current_source is not None:
+                # Whatever was playing before the failed nab still is.
+                self._show_now_playing(self._current_source)
+                self.now_playing.set_status("Playing in mpv's window")
+            self._sync_background_download()
         self._show_toast(f"Couldn't nab that: {msg}", timeout=5)
         return False
 
@@ -574,8 +606,10 @@ class NabWindow(Adw.ApplicationWindow):
 
     def _on_resolved(self, source: ResolvedSource) -> bool:
         self._set_resolving(False)
-        if not source.source_type.is_torrent:
-            self._teardown_torrent(full=False)
+        if source.source_type.is_torrent:
+            self._sync_background_download()
+        else:
+            self._release_torrent()
         self._current_source = source
         try:
             self._current_entry_id = self.history.upsert_play(
@@ -723,6 +757,65 @@ class NabWindow(Adw.ApplicationWindow):
             return False
         self.now_playing.update_torrent(st)
         return True
+
+    # ------------------------------------------------------ background download
+
+    def _sync_background_download(self) -> None:
+        """Follow whatever the engine is finishing, if anything (main thread)."""
+        if not self._refresh_background_download():
+            self._stop_background_download_watch()
+        elif self._background_download_source is None:
+            self._background_download_source = GLib.timeout_add_seconds(
+                _TORRENT_STATS_INTERVAL, self._background_download_tick
+            )
+
+    def _stop_background_download_watch(self) -> None:
+        if self._background_download_source is not None:
+            GLib.source_remove(self._background_download_source)
+            self._background_download_source = None
+        self.background_download.hide()
+
+    def _background_download_tick(self) -> bool:
+        if self._refresh_background_download():
+            return True
+        self._background_download_source = None
+        return False
+
+    def _refresh_background_download(self) -> bool:
+        """Update the strip. Returns whether there's still a download to follow."""
+        st = _engine_background_status()
+        if st is None:
+            self.background_download.hide()
+            return False
+        if st.finished:
+            # Done: drop the torrent rather than leave it seeding unattended.
+            self._drop_background_torrent()
+            if self.background_download.shown:
+                self.background_download.hide()
+                self._show_toast("Background download finished")
+            return False
+        self.background_download.update(self._background_download_title(st), st)
+        return True
+
+    def _background_download_title(self, st) -> str:
+        """Name what's downloading now, in library terms if known."""
+        if not st.pending:
+            return st.name  # just a subtitle or two left
+        file = st.pending[0]
+        title = (
+            self.library.describe(join_torrent_fragment(st.source, file.sub_path))
+            or file.name
+        )
+        others = len(st.pending) - 1
+        return f"{title} + {others} more" if others else title
+
+    def _cancel_background_download(self) -> None:
+        self._stop_background_download_watch()
+        self._drop_background_torrent()
+
+    def _drop_background_torrent(self) -> None:
+        from nab.torrent.engine import drop_engine_background
+        drop_engine_background()
 
     # ------------------------------------------------------------- mpv events
 

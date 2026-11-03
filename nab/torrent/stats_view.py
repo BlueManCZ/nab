@@ -13,7 +13,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
 
-def _format_size(num_bytes: float) -> str:
+def format_size(num_bytes: float) -> str:
     n = max(0.0, float(num_bytes))
     if n >= 1 << 30:
         return f"{n / (1 << 30):.1f} GB"
@@ -25,7 +25,7 @@ def _format_size(num_bytes: float) -> str:
 
 
 def format_rate(bytes_per_sec: float) -> str:
-    return f"{_format_size(bytes_per_sec)}/s"
+    return f"{format_size(bytes_per_sec)}/s"
 
 
 def _stat_tile(icon_name: str, caption: str) -> tuple[Gtk.Widget, Gtk.Label]:
@@ -105,7 +105,7 @@ class TorrentStatsView:
         if st.total_wanted > 0:
             frac = min(1.0, st.total_done / st.total_wanted)
             self._progress.set_fraction(frac)
-            self._progress.set_text(f"{frac * 100:.0f}% of {_format_size(st.total_wanted)}")
+            self._progress.set_text(f"{frac * 100:.0f}% of {format_size(st.total_wanted)}")
         else:
             self._progress.set_fraction(0.0)
             self._progress.set_text("Buffering…")
