@@ -90,6 +90,19 @@ def _parse_season_episode(
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def find_season_episode(name: str) -> re.Match[str] | None:
+    """The first season/episode token in `name`, most explicit form first.
+
+    Groups 1 and 2 are the season and episode numbers; the match span lets
+    callers split the name into the show title before the token and the
+    episode title after it.
+    """
+    for pattern in _SEASON_EPISODE_PATTERNS:
+        if (m := pattern.search(name)) is not None:
+            return m
+    return None
+
+
 def _season_episode_view(
     current: str, siblings: list[str]
 ) -> SeriesView | None:

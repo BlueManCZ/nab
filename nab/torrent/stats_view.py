@@ -1,8 +1,8 @@
 """Live torrent transfer stats, rendered as a small dashboard.
 
-Shown on the now-playing card while a torrent streams. Holds no libtorrent
-dependency — it just reads attributes off whatever status snapshot it's
-handed (see ``TorrentStatus`` in :mod:`nab.torrent.engine`), so it imports
+Shown in the now-playing strip's popover while a torrent streams. Holds no
+libtorrent dependency — it just reads attributes off whatever status snapshot
+it's handed (see ``TorrentStatus`` in :mod:`nab.torrent.engine`), so it imports
 cleanly even when libtorrent isn't installed.
 """
 
@@ -24,7 +24,7 @@ def _format_size(num_bytes: float) -> str:
     return f"{n:.0f} B"
 
 
-def _format_rate(bytes_per_sec: float) -> str:
+def format_rate(bytes_per_sec: float) -> str:
     return f"{_format_size(bytes_per_sec)}/s"
 
 
@@ -98,8 +98,8 @@ class TorrentStatsView:
 
     def update(self, st) -> None:
         """Refresh from a ``TorrentStatus`` snapshot."""
-        self._down.set_text(_format_rate(st.download_rate))
-        self._up.set_text(_format_rate(st.upload_rate))
+        self._down.set_text(format_rate(st.download_rate))
+        self._up.set_text(format_rate(st.upload_rate))
         self._peers.set_text(str(st.num_peers))
         self._seeds.set_text(str(st.num_seeds))
         if st.total_wanted > 0:

@@ -14,22 +14,26 @@ from nab import MEDIA_EXTENSIONS  # noqa: E402
 from nab.gtkutil import log_dialog_error  # noqa: E402
 from nab.history import HistoryDatabase  # noqa: E402
 from nab.history.sidebar import HistorySidebar  # noqa: E402
+from nab.library.store import LibraryStore  # noqa: E402
+from nab.library.view import LibraryView  # noqa: E402
+from nab.nowplaying import NowPlayingBar  # noqa: E402
 from nab.playback import PlaybackConfig  # noqa: E402
 from nab.player import Player  # noqa: E402
 from nab.resolver import ResolvedSource, resolve  # noqa: E402
-from nab.resolver.source import TORRENT_FILE_SUFFIX, torrent_for_cache_path  # noqa: E402
+from nab.resolver.source import (  # noqa: E402
+    TORRENT_FILE_SUFFIX,
+    split_torrent_fragment,
+    torrent_for_cache_path,
+)
 from nab.series.nav import SeriesNavigator  # noqa: E402
 from nab.subtitles import SubtitlesConfig  # noqa: E402
-from nab.torrent.stats_view import TorrentStatsView  # noqa: E402
 from nab.subtitles.panel import SubtitlePanel  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-# Don't offer to resume a file the user barely started.
-_RESUME_MIN_SECONDS = 5.0
 # How often to persist the current playback position to history.
 _POSITION_SAVE_INTERVAL = 5
-# How often to refresh the live torrent stats widget on the now-playing card.
+# How often to refresh the live torrent stats on the now-playing strip.
 _TORRENT_STATS_INTERVAL = 1
 # Debounce window for persisting the volume; the slider fires continuously
 # while dragged, so we coalesce writes to config.toml.
@@ -45,6 +49,15 @@ def _format_time(seconds: float | None) -> str:
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _torrent_cache_dir() -> Path | None:
+    """Where finished torrent files live, or None without libtorrent."""
+    from nab.torrent import is_available
+    if not is_available():
+        return None
+    from nab.torrent.config import TorrentConfig
+    return TorrentConfig.load().effective_cache_dir
 
 
 def _engine_status():
@@ -88,6 +101,7 @@ class NabWindow(Adw.ApplicationWindow):
         self.set_title("Nab")
 
         self.history = HistoryDatabase()
+        self.library_store = LibraryStore(self.history.path)
         self.history_sidebar = HistorySidebar(
             self.history, on_activate=self._on_history_activate
         )
@@ -118,13 +132,15 @@ class NabWindow(Adw.ApplicationWindow):
             get_player=lambda: self.player,
             show_toast=self._show_toast,
         )
-        self.torrent_stats = TorrentStatsView()
+        self.now_playing = NowPlayingBar(on_open=self._on_now_playing_open)
 
         self._build_ui()
         # No mpv yet — its window only opens once there's something to play.
 
         self.connect("close-request", self._on_close_request)
         self.history_sidebar.refresh()
+        self.library.refresh()
+        self.library.backfill_async()
 
     # ---------------------------------------------------------------- UI build
 
@@ -148,10 +164,25 @@ class NabWindow(Adw.ApplicationWindow):
         )
 
     def _build_content(self) -> Gtk.Widget:
+        # The library is a navigation view whose root page carries the input
+        # header; the now-playing strip and transport sit beneath it all, so
+        # playback stays in reach on every page.
+        self.library = LibraryView(
+            self.history,
+            self.library_store,
+            header=self._build_header(),
+            play=self._play_from_library,
+            add_toast=self._toast_overlay.add_toast,
+            cache_dir=_torrent_cache_dir,
+        )
+        bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bottom.append(self.now_playing.widget)
+        bottom.append(self._build_controls())
+
         toolbar = Adw.ToolbarView()
-        toolbar.add_top_bar(self._build_header())
-        toolbar.set_content(self._build_video_area())
-        toolbar.add_bottom_bar(self._build_controls())
+        toolbar.set_content(self.library.widget)
+        toolbar.add_bottom_bar(bottom)
+        toolbar.set_bottom_bar_style(Adw.ToolbarStyle.RAISED_BORDER)
         return toolbar
 
     def _build_header(self) -> Gtk.Widget:
@@ -204,25 +235,6 @@ class NabWindow(Adw.ApplicationWindow):
         header.pack_end(menu_button)
 
         return header
-
-    def _build_video_area(self) -> Gtk.Widget:
-        # mpv runs in its own window — Wayland has no protocol for embedding
-        # a foreign-process surface today, and libmpv's render API would cost
-        # us gpu-next/HDR. So Nab's window is the controller and mpv is the
-        # player. This placeholder describes what's loaded.
-        self.video_status_page = Adw.StatusPage()
-        self.video_status_page.set_icon_name("video-x-generic-symbolic")
-        self.video_status_page.set_title("Nab anything")
-        self.video_status_page.set_description(
-            "Paste a URL, magnet, or file path above and press Enter — "
-            "a .torrent file works too. The video plays in mpv's own window."
-        )
-        self.video_status_page.set_vexpand(True)
-        # Live torrent dashboard lives in the status page's content slot; it
-        # only becomes visible while a torrent is streaming (see _loadfile_now).
-        self.torrent_stats.widget.set_visible(False)
-        self.video_status_page.set_child(self.torrent_stats.widget)
-        return self.video_status_page
 
     def _build_controls(self) -> Gtk.Widget:
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -332,8 +344,7 @@ class NabWindow(Adw.ApplicationWindow):
     def _on_mpv_failed(self, msg: str) -> bool:
         self._mpv_starting = False
         self._pending_source = None
-        self.video_status_page.set_title("Failed to start mpv")
-        self.video_status_page.set_description(msg)
+        self.now_playing.show("Couldn't start mpv", msg)
         self._show_toast(f"Couldn't start mpv: {msg}", timeout=6)
         return False
 
@@ -379,11 +390,10 @@ class NabWindow(Adw.ApplicationWindow):
             self.seek_adjustment.set_value(0)
         self.position_label.set_text("--:--")
         self.duration_label.set_text("--:--")
-        self.video_status_page.set_title("Playback stopped")
-        self.video_status_page.set_description(
-            "You closed the mpv window. Pick something from history or paste a "
-            "new link to play again."
-        )
+        self.set_title("Nab")
+        self.now_playing.hide()
+        # The last position just landed in history; show it on the shelf.
+        self.library.set_current(None)
 
     def shutdown_player(self) -> None:
         if self._save_position_source is not None:
@@ -470,9 +480,14 @@ class NabWindow(Adw.ApplicationWindow):
         # mpv is spawned on demand once we know what to play (see
         # _begin_playback), so resolving can start without a running player.
         self._set_resolving(True)
-        # A previous torrent may still be polling stats into the card; silence it
-        # so resolve-progress and "Starting mpv…" messages aren't overwritten.
+        # A previous torrent may still be polling stats into the strip; silence
+        # it so resolve-progress and "Starting mpv…" messages aren't overwritten.
         self._stop_torrent_stats()
+        if not recovering:
+            self.now_playing.show(
+                self.library.describe(text) or "Nabbing…", "Resolving…", busy=True
+            )
+            self.now_playing.set_openable(False)
 
         def on_progress(msg: str) -> None:
             GLib.idle_add(self._on_resolve_progress, msg)
@@ -537,13 +552,18 @@ class NabWindow(Adw.ApplicationWindow):
             self.input_spinner.stop()
 
     def _on_resolve_progress(self, msg: str) -> bool:
-        self.video_status_page.set_title("Nabbing…")
-        self.video_status_page.set_description(msg)
+        self.now_playing.set_status(msg, busy=True)
         return False
 
     def _on_resolve_failed(self, msg: str) -> bool:
         log.warning("resolve failed: %s", msg)
         self._set_resolving(False)
+        if self.player is None or not self.player.running:
+            self.now_playing.hide()
+        elif self._current_source is not None:
+            # Whatever was playing before the failed nab still is.
+            self._show_now_playing(self._current_source)
+            self.now_playing.set_status("Playing in mpv's window")
         self._show_toast(f"Couldn't nab that: {msg}", timeout=5)
         return False
 
@@ -568,19 +588,47 @@ class NabWindow(Adw.ApplicationWindow):
             log.exception("history upsert failed")
             self._current_entry_id = None
 
-        title = source.title or source.original_input
-        self.set_title(f"Nab — {title}")
-        self.video_status_page.set_title(title)
-        self.video_status_page.set_description("Starting mpv…")
+        if source.torrent is not None:
+            base, _ = split_torrent_fragment(source.original_input)
+            try:
+                self.library_store.add(base, source.torrent)
+            except Exception:
+                log.exception("library add failed")
 
         # Metadata-only UI; safe to run before mpv is up.
         self.subtitle_panel.on_source(source)
         self.series_nav.update(source)
         self.history_sidebar.refresh()
+        self.library.set_current(source.original_input)
+
+        self._show_now_playing(source)
+        self.now_playing.set_status("Starting mpv…", busy=True)
 
         # Hand off to mpv, spawning its window first if there isn't one.
         self._begin_playback(source)
         return False
+
+    def _show_now_playing(self, source: ResolvedSource) -> None:
+        """Title the strip and window after `source`, in library terms if known."""
+        title = (
+            self.library.describe(source.original_input)
+            or source.title
+            or source.original_input
+        )
+        self.set_title(f"Nab — {title}")
+        self.now_playing.show(title, "")
+        self.now_playing.set_openable(
+            self.library.describe(source.original_input) is not None
+        )
+
+    def _on_now_playing_open(self) -> None:
+        if self._current_source is not None:
+            self.library.show_title_for(self._current_source.original_input)
+
+    def _play_from_library(self, input_str: str) -> None:
+        # Leave the outgoing episode's position in history before switching.
+        self._save_position_now(False)
+        self.play_input(input_str)
 
     def _begin_playback(self, source: ResolvedSource) -> None:
         """Play `source` in mpv, spawning mpv first if its window isn't open.
@@ -617,7 +665,7 @@ class NabWindow(Adw.ApplicationWindow):
         resume_pos: float | None = None
         if self._current_entry_id is not None:
             entry = self.history.get(self._current_entry_id)
-            if entry is not None and entry.last_position > _RESUME_MIN_SECONDS and not entry.completed:
+            if entry is not None and entry.resumable:
                 resume_pos = entry.last_position
 
         log.info(
@@ -628,15 +676,12 @@ class NabWindow(Adw.ApplicationWindow):
         # mpv preserves `pause` across loadfile; explicitly resume so opening
         # a new file from a paused state plays it.
         player.set_property("pause", False)
-        self.video_status_page.set_description(
-            f"Source: {source.source_type.value}. Playing in mpv's window."
-        )
+        self.now_playing.set_status("Playing in mpv's window")
         # Torrents keep downloading in the background while mpv plays, so show
-        # the live transfer dashboard; everything else hides it.
+        # the live transfer readout; everything else hides it.
         self._stop_torrent_stats()
         if source.source_type.is_torrent:
-            self.torrent_stats.reset()
-            self.torrent_stats.widget.set_visible(True)
+            self.now_playing.start_torrent()
             self._start_torrent_stats()
 
         self.play_pause_button.set_sensitive(True)
@@ -657,7 +702,7 @@ class NabWindow(Adw.ApplicationWindow):
     # ----------------------------------------------------------- torrent stats
 
     def _start_torrent_stats(self) -> None:
-        """Poll the torrent engine and refresh the now-playing card."""
+        """Poll the torrent engine and refresh the now-playing strip."""
         if self._torrent_stats_source is None:
             self._torrent_stats_source = GLib.timeout_add_seconds(
                 _TORRENT_STATS_INTERVAL, self._torrent_stats_tick
@@ -667,16 +712,16 @@ class NabWindow(Adw.ApplicationWindow):
         if self._torrent_stats_source is not None:
             GLib.source_remove(self._torrent_stats_source)
             self._torrent_stats_source = None
-        self.torrent_stats.widget.set_visible(False)
+        self.now_playing.stop_torrent()
 
     def _torrent_stats_tick(self) -> bool:
         st = _engine_status()
         if st is None:
-            # Torrent gone (stopped/cleaned up) — drop the dashboard and lapse.
+            # Torrent gone (stopped/cleaned up) — drop the readout and lapse.
             self._torrent_stats_source = None
-            self.torrent_stats.widget.set_visible(False)
+            self.now_playing.stop_torrent()
             return False
-        self.torrent_stats.update(st)
+        self.now_playing.update_torrent(st)
         return True
 
     # ------------------------------------------------------------- mpv events
@@ -741,14 +786,20 @@ class NabWindow(Adw.ApplicationWindow):
         # If yt-dlp didn't give us a title, mpv may eventually produce one.
         if self._current_source and not self._current_source.title:
             self.set_title(f"Nab — {title}")
-            self.video_status_page.set_title(title)
+            self.now_playing.set_title(title)
         return False
 
     def _on_end_file(self, data: dict) -> None:
         reason = data.get("reason")
         log.info("end-file reason=%s", reason)
         if reason == "eof":
-            GLib.idle_add(self._save_position_now, True)
+            GLib.idle_add(self._on_finished)
+
+    def _on_finished(self) -> bool:
+        """The file played to the end: record it and tick it off the library."""
+        self._save_position_now(True)
+        self.library.refresh()
+        return False
 
     # ---------------------------------------------------- transport / volume
 

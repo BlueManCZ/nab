@@ -14,6 +14,7 @@ from nab.resolver.source import is_http_url, is_magnet_uri, magnet_info_hash
 from nab.series import detect_series
 from nab.torrent.config import TorrentConfig
 from nab.torrent.http_server import ByteRangeServer
+from nab.torrent.model import TorrentFile, TorrentInfo
 
 log = logging.getLogger(__name__)
 
@@ -149,16 +150,54 @@ def torrent_identity(uri: str) -> str | None:
         return None
 
 
-@dataclass(slots=True, frozen=True)
-class TorrentFile:
-    """One file inside a torrent, as exposed to the rest of the app."""
-    index: int
-    sub_path: str    # path inside the torrent, e.g. "Show.S01/E01.mkv"
-    size: int
+def _build_info(ti: lt.torrent_info, info_hash: str | None) -> TorrentInfo:
+    """Sort a torrent's files into the videos and bundled sidecars we care about."""
+    fs = ti.files()
+    videos: list[TorrentFile] = []
+    subtitles: list[TorrentFile] = []
+    for i in range(fs.num_files()):
+        sub_path = fs.file_path(i)
+        size = fs.file_size(i)
+        suffix = Path(sub_path).suffix.lower()
+        if suffix in VIDEO_EXTENSIONS:
+            videos.append(TorrentFile(index=i, sub_path=sub_path, size=size))
+        elif (
+            suffix in _BUNDLED_SUBTITLE_EXTENSIONS
+            and size <= _MAX_BUNDLED_SUBTITLE_SIZE
+        ):
+            subtitles.append(TorrentFile(index=i, sub_path=sub_path, size=size))
 
-    @property
-    def name(self) -> str:
-        return Path(self.sub_path).name
+    videos.sort(key=lambda f: f.sub_path)
+    subtitles.sort(key=lambda f: f.sub_path)
+    return TorrentInfo(
+        info_hash=info_hash,
+        video_files=tuple(videos),
+        subtitle_files=tuple(subtitles),
+        name=ti.name(),
+    )
+
+
+def read_cached_info(uri: str) -> TorrentInfo | None:
+    """Metadata for the torrent source `uri` from what's already on disk.
+
+    Tries the resume data a previous session saved (it carries the info-dict,
+    so this covers magnets too), then the .torrent file itself. Never touches
+    the swarm, so it's cheap enough to run over a whole history; returns None
+    when nothing local describes the torrent. Safe to call from any thread.
+    """
+    info_hash = torrent_identity(uri)
+    ti: lt.torrent_info | None = None
+    if info_hash is not None and (path := _resume_path(info_hash)).is_file():
+        try:
+            ti = lt.read_resume_data(path.read_bytes()).ti
+        except Exception:
+            log.warning("unreadable resume data %s", path)
+    if ti is None and not is_magnet_uri(uri):
+        try:
+            ti = _read_torrent_file(uri)
+        except ValueError:
+            return None
+    return _build_info(ti, info_hash) if ti is not None else None
 
 
 @dataclass(slots=True, frozen=True)
@@ -170,27 +209,6 @@ class TorrentStatus:
     num_seeds: int      # connected seeds
     total_done: int     # selected-file bytes downloaded so far
     total_wanted: int   # selected-file size in bytes
-
-
-@dataclass(slots=True, frozen=True)
-class TorrentInfo:
-    """Metadata about an open torrent. video_files is sorted by sub_path.
-
-    ``subtitle_files`` holds the sidecars worth fetching (see
-    ``_BUNDLED_SUBTITLE_EXTENSIONS``), not every subtitle in the torrent.
-    """
-    info_hash: str | None
-    video_files: tuple[TorrentFile, ...]
-    subtitle_files: tuple[TorrentFile, ...] = ()
-
-    def by_index(self, index: int) -> TorrentFile | None:
-        return next((f for f in self.video_files if f.index == index), None)
-
-    def by_sub_path(self, sub_path: str) -> TorrentFile | None:
-        return next((f for f in self.video_files if f.sub_path == sub_path), None)
-
-    def by_name(self, name: str) -> TorrentFile | None:
-        return next((f for f in self.video_files if f.name == name), None)
 
 
 def match_subtitle_files(
@@ -364,40 +382,21 @@ class TorrentEngine:
             log.info("metadata received")
 
         ti = h.torrent_file()
-        fs = ti.files()
-        videos: list[TorrentFile] = []
-        subtitles: list[TorrentFile] = []
-        for i in range(fs.num_files()):
-            sub_path = fs.file_path(i)
-            size = fs.file_size(i)
-            suffix = Path(sub_path).suffix.lower()
-            if suffix in VIDEO_EXTENSIONS:
-                videos.append(TorrentFile(index=i, sub_path=sub_path, size=size))
-            elif (
-                suffix in _BUNDLED_SUBTITLE_EXTENSIONS
-                and size <= _MAX_BUNDLED_SUBTITLE_SIZE
-            ):
-                subtitles.append(TorrentFile(index=i, sub_path=sub_path, size=size))
-
-        if not videos:
+        info = _build_info(ti, new_hash)
+        if not info.video_files:
+            fs = ti.files()
             names = [fs.file_path(i) for i in range(fs.num_files())]
             self.cleanup()
             raise ValueError(
                 f"No video file found in torrent. Files: {', '.join(names)}"
             )
 
-        videos.sort(key=lambda f: f.sub_path)
-        subtitles.sort(key=lambda f: f.sub_path)
-        self._info = TorrentInfo(
-            info_hash=new_hash,
-            video_files=tuple(videos),
-            subtitle_files=tuple(subtitles),
-        )
+        self._info = info
         log.info(
             "torrent has %d video file(s), %d bundled subtitle(s)",
-            len(videos), len(subtitles),
+            len(info.video_files), len(info.subtitle_files),
         )
-        return self._info
+        return info
 
     def select_file(
         self,

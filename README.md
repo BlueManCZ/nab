@@ -40,6 +40,12 @@ What works:
   replay. The torrent cache directory is configurable in Preferences.
 - Series navigation: a prev/next + episode picker appears for on-disk series
   (`S01E01`, `01`, …) and multi-file torrents.
+- Library: every torrent you nab is shelved by title, so a show's seasons from
+  separate torrents (even duplicate releases) merge into one entry. The home
+  screen leads with "Continue Watching", then a poster grid; a show's page lists
+  episodes by season with watched / in-progress / up-next state, and episodes
+  can be marked watched by hand. Torrents nabbed before the library existed are
+  picked up from their cached resume data on start.
 
 `libtorrent` and `subliminal` are optional — Nab degrades gracefully when they
 aren't installed (torrent sources and subtitle discovery are simply disabled). See

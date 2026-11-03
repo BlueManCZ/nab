@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 
 from nab.history.model import HistoryEntry
@@ -118,6 +119,47 @@ class HistoryDatabase:
         ).fetchone()
         return _row_to_entry(row) if row is not None else None
 
+    def set_watched(
+        self, input: str, *, source_type: str, title: str | None, watched: bool
+    ) -> None:
+        """Mark `input` watched or unwatched by hand.
+
+        Either way the resume position is dropped: a watched episode plays
+        from the start, and "unwatched" means "start over". Marking watched
+        records an input never played (as zero plays, which keeps it out of
+        the history list) and bumps ``last_played_at``, so the library's "up
+        next" moves past it.
+        """
+        if watched:
+            self._conn.execute(
+                """
+                INSERT INTO history (input, source_type, title, completed, play_count)
+                VALUES (?, ?, ?, 1, 0)
+                ON CONFLICT(input) DO UPDATE SET
+                    completed = 1,
+                    last_position = 0,
+                    last_played_at = CURRENT_TIMESTAMP
+                """,
+                (input, source_type, title),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE history SET completed = 0, last_position = 0 WHERE input = ?",
+                (input,),
+            )
+
+    def entries_of(self, source_types: Iterable[str]) -> list[HistoryEntry]:
+        """Every entry of the given source types, in no particular order."""
+        kinds = sorted(source_types)
+        rows = self._conn.execute(
+            f"""
+            SELECT {_COLUMNS} FROM history
+            WHERE source_type IN ({",".join("?" * len(kinds))})
+            """,
+            kinds,
+        ).fetchall()
+        return [_row_to_entry(r) for r in rows]
+
     def torrent_inputs(self) -> list[str]:
         """Every magnet / .torrent input, most-recently-played first.
 
@@ -141,6 +183,7 @@ class HistoryDatabase:
             f"""
             SELECT {_COLUMNS}
             FROM history
+            WHERE play_count > 0
             ORDER BY last_played_at DESC
             LIMIT ?
             """,

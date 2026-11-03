@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 from nab import MEDIA_EXTENSIONS
+from nab.torrent.model import TorrentInfo
 
 log = logging.getLogger(__name__)
 
@@ -134,9 +135,13 @@ class ResolvedSource:
     title: str | None
     duration: float | None
     original_input: str
+    # The open torrent's metadata, for torrent sources; lets the library
+    # record what the torrent holds without asking the engine again.
+    torrent: TorrentInfo | None = None
 
 
-def _classify(input_str: str) -> SourceType:
+def classify(input_str: str) -> SourceType:
+    """Which kind of source `input_str` names, from its shape alone (no I/O)."""
     # Only torrent sources carry our ``#file=`` fragment, so strip it before
     # looking at the input — a magnet or .torrent path is still one with it.
     base, _ = split_torrent_fragment(input_str)
@@ -266,6 +271,7 @@ def _resolve_torrent(
         title=title,
         duration=None,
         original_input=normalised_input,
+        torrent=info,
     )
 
 
@@ -287,7 +293,7 @@ def resolve(
     Runs network calls (yt-dlp). Call this from a worker thread.
     """
     input_str = input_str.strip()
-    kind = _classify(input_str)
+    kind = classify(input_str)
     log.info("classified %r as %s", input_str, kind.value)
 
     if kind.is_torrent:
