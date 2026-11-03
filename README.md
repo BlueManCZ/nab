@@ -38,8 +38,17 @@ What works:
   own metadata, so it starts without the swarm metadata wait. A `.torrent` URL
   is downloaded to `$XDG_CACHE_HOME/nab/metainfo` first and served from there on
   replay. The torrent cache directory is configurable in Preferences.
+  Stopping doesn't waste the head start: the episode and the ones queued behind
+  it finish downloading while Nab stays open, in a strip you can cancel, and the
+  torrent is dropped once they're in so it doesn't keep seeding.
 - Series navigation: a prev/next + episode picker appears for on-disk series
   (`S01E01`, `01`, …) and multi-file torrents.
+- Library: every torrent you nab is shelved by title, so a show's seasons from
+  separate torrents (even duplicate releases) merge into one entry. The home
+  screen leads with "Continue Watching", then a poster grid; a show's page lists
+  episodes by season with watched / in-progress / up-next state, and episodes
+  can be marked watched by hand. Torrents nabbed before the library existed are
+  picked up from their cached resume data on start.
 
 `libtorrent` and `subliminal` are optional — Nab degrades gracefully when they
 aren't installed (torrent sources and subtitle discovery are simply disabled). See

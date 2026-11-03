@@ -1,8 +1,8 @@
 """Live torrent transfer stats, rendered as a small dashboard.
 
-Shown on the now-playing card while a torrent streams. Holds no libtorrent
-dependency — it just reads attributes off whatever status snapshot it's
-handed (see ``TorrentStatus`` in :mod:`nab.torrent.engine`), so it imports
+Shown in the now-playing strip's popover while a torrent streams. Holds no
+libtorrent dependency — it just reads attributes off whatever status snapshot
+it's handed (see ``TorrentStatus`` in :mod:`nab.torrent.engine`), so it imports
 cleanly even when libtorrent isn't installed.
 """
 
@@ -13,7 +13,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
 
-def _format_size(num_bytes: float) -> str:
+def format_size(num_bytes: float) -> str:
     n = max(0.0, float(num_bytes))
     if n >= 1 << 30:
         return f"{n / (1 << 30):.1f} GB"
@@ -24,8 +24,8 @@ def _format_size(num_bytes: float) -> str:
     return f"{n:.0f} B"
 
 
-def _format_rate(bytes_per_sec: float) -> str:
-    return f"{_format_size(bytes_per_sec)}/s"
+def format_rate(bytes_per_sec: float) -> str:
+    return f"{format_size(bytes_per_sec)}/s"
 
 
 def _stat_tile(icon_name: str, caption: str) -> tuple[Gtk.Widget, Gtk.Label]:
@@ -98,14 +98,14 @@ class TorrentStatsView:
 
     def update(self, st) -> None:
         """Refresh from a ``TorrentStatus`` snapshot."""
-        self._down.set_text(_format_rate(st.download_rate))
-        self._up.set_text(_format_rate(st.upload_rate))
+        self._down.set_text(format_rate(st.download_rate))
+        self._up.set_text(format_rate(st.upload_rate))
         self._peers.set_text(str(st.num_peers))
         self._seeds.set_text(str(st.num_seeds))
         if st.total_wanted > 0:
             frac = min(1.0, st.total_done / st.total_wanted)
             self._progress.set_fraction(frac)
-            self._progress.set_text(f"{frac * 100:.0f}% of {_format_size(st.total_wanted)}")
+            self._progress.set_text(f"{frac * 100:.0f}% of {format_size(st.total_wanted)}")
         else:
             self._progress.set_fraction(0.0)
             self._progress.set_text("Buffering…")
